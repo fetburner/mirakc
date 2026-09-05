@@ -11,7 +11,9 @@ use axum::http::header::ACCEPT_RANGES;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_RANGE;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::ETAG;
 use axum::http::header::HOST;
+use axum::http::header::LAST_MODIFIED;
 use axum::http::header::LOCATION;
 use axum::response::Response;
 use http_body_util::BodyExt; // for `collect`
@@ -598,9 +600,94 @@ async fn test_get_recording_record_stream() {
     assert_matches!(res.headers().get(CONTENT_TYPE), Some(v) => {
         assert_eq!(v, "video/MP2T");
     });
+    assert_matches!(res.headers().get(ETAG), Some(v) => {
+        assert_eq!(v, "\"84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882\"");
+    });
+    assert_matches!(res.headers().get(LAST_MODIFIED), Some(_));
+    assert_matches!(res.headers().get(CACHE_CONTROL), Some(v) => {
+        assert_eq!(v, "private, immutable, max-age=31536000");
+    });
     assert_matches!(res.headers().get(X_MIRAKURUN_TUNER_USER_ID), Some(_));
     let content = into_text(res).await;
     assert_eq!(content, "0123456789");
+
+    // finished, w/ matching ETag
+    let res = get_with_test_config(
+        "/api/recording/records/finished/stream",
+        maplit::hashmap! {
+            "request_headers" => to_json!([(
+                "if-none-match",
+                "\"84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882\""
+            )]),
+        },
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_matches!(res.headers().get(ETAG), Some(v) => {
+        assert_eq!(v, "\"84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882\"");
+    });
+
+    // finished, w/ non-matching ETag
+    let res = get_with_test_config(
+        "/api/recording/records/finished/stream",
+        maplit::hashmap! {
+            "request_headers" => to_json!([("if-none-match", "\"different\"")]),
+        },
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let content = into_text(res).await;
+    assert_eq!(content, "0123456789");
+
+    // finished, w/ matching Last-Modified
+    let res = get_with_test_config(
+        "/api/recording/records/finished/stream",
+        maplit::hashmap! {
+            "request_headers" => to_json!([(
+                "if-modified-since",
+                "Thu, 31 Dec 2099 23:59:59 GMT"
+            )]),
+        },
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+
+    // finished, w/ an If-Range mismatch
+    let res = get_with_test_config(
+        "/api/recording/records/finished/stream",
+        maplit::hashmap! {
+            "request_headers" => to_json!([
+                ("range", "bytes=1-3"),
+                ("if-range", "\"different\"")
+            ]),
+        },
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_matches!(res.headers().get(CONTENT_RANGE), None);
+    let content = into_text(res).await;
+    assert_eq!(content, "0123456789");
+
+    // finished, w/ an If-Range match
+    let res = get_with_test_config(
+        "/api/recording/records/finished/stream",
+        maplit::hashmap! {
+            "request_headers" => to_json!([
+                ("range", "bytes=1-3"),
+                (
+                    "if-range",
+                    "\"84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882\""
+                )
+            ]),
+        },
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_matches!(res.headers().get(CONTENT_RANGE), Some(v) => {
+        assert_eq!(v, "bytes 1-3/10");
+    });
+    let content = into_text(res).await;
+    assert_eq!(content, "123");
 
     // finished, w/ seekable filters
     let res = get("/api/recording/records/finished/stream?pre-filters[]=cat").await;
@@ -613,6 +700,11 @@ async fn test_get_recording_record_stream() {
     });
     assert_matches!(res.headers().get(CONTENT_TYPE), Some(v) => {
         assert_eq!(v, "video/MP2T");
+    });
+    assert_matches!(res.headers().get(ETAG), None);
+    assert_matches!(res.headers().get(LAST_MODIFIED), Some(_));
+    assert_matches!(res.headers().get(CACHE_CONTROL), Some(v) => {
+        assert_eq!(v, "private, immutable, max-age=31536000");
     });
     let content = into_text(res).await;
     assert_eq!(content, "0123456789");
@@ -694,6 +786,11 @@ async fn test_get_recording_record_stream() {
     assert_matches!(res.headers().get(CONTENT_LENGTH), None);
     assert_matches!(res.headers().get(CONTENT_TYPE), Some(v) => {
         assert_eq!(v, "video/MP2T");
+    });
+    assert_matches!(res.headers().get(ETAG), None);
+    assert_matches!(res.headers().get(LAST_MODIFIED), None);
+    assert_matches!(res.headers().get(CACHE_CONTROL), Some(v) => {
+        assert_eq!(v, "no-store");
     });
     assert_matches!(res.headers().get(X_MIRAKURUN_TUNER_USER_ID), Some(_));
     let content = into_text(res).await;
@@ -829,7 +926,28 @@ async fn test_head_recording_record_stream() {
     assert_matches!(res.headers().get(CONTENT_TYPE), Some(v) => {
         assert_eq!(v, "video/MP2T");
     });
+    assert_matches!(res.headers().get(ETAG), Some(v) => {
+        assert_eq!(v, "\"84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882\"");
+    });
+    assert_matches!(res.headers().get(LAST_MODIFIED), Some(_));
+    assert_matches!(res.headers().get(CACHE_CONTROL), Some(v) => {
+        assert_eq!(v, "private, immutable, max-age=31536000");
+    });
     assert_matches!(res.headers().get(X_MIRAKURUN_TUNER_USER_ID), Some(_));
+
+    // finished, w/ matching ETag
+    let res = head_with_test_config(
+        "/api/recording/records/finished/stream",
+        maplit::hashmap! {
+            "request_headers" => to_json!([(
+                "if-none-match",
+                "\"84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882\""
+            )]),
+        },
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_matches!(res.headers().get(ETAG), Some(_));
 
     // finished, w/ seekable filters
     let res = head("/api/recording/records/finished/stream?pre-filters[]=cat").await;
@@ -915,6 +1033,11 @@ async fn test_head_recording_record_stream() {
     assert_matches!(res.headers().get(CONTENT_LENGTH), None);
     assert_matches!(res.headers().get(CONTENT_TYPE), Some(v) => {
         assert_eq!(v, "video/MP2T");
+    });
+    assert_matches!(res.headers().get(ETAG), None);
+    assert_matches!(res.headers().get(LAST_MODIFIED), None);
+    assert_matches!(res.headers().get(CACHE_CONTROL), Some(v) => {
+        assert_eq!(v, "no-store");
     });
     assert_matches!(res.headers().get(X_MIRAKURUN_TUNER_USER_ID), Some(_));
 
@@ -1910,7 +2033,7 @@ async fn head_with_test_config(
 ) -> Response {
     let app = create_app(&test_config);
     // The axum_extract::Host requires an HTTP Host request header for tests to work properly.
-    let mut builder = Request::get(endpoint).header(
+    let mut builder = Request::head(endpoint).header(
         HOST,
         if let Some(host) = test_config.get("host") {
             host

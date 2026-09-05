@@ -4,6 +4,7 @@ use std::task::Poll;
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::http::Request;
+use axum::http::header::CACHE_CONTROL;
 use axum::response::Response;
 use futures::future::BoxFuture;
 use tower::Layer;
@@ -54,7 +55,21 @@ where
         let fut = self.inner.call(req);
         Box::pin(async move {
             let mut res = fut.await?;
-            res.headers_mut().extend(headers);
+            for (name, value) in headers.iter() {
+                let should_insert = if name == CACHE_CONTROL {
+                    // Keep the default no-store policy for SSE responses, which set no-cache,
+                    // while allowing endpoints to opt into a more specific cache policy.
+                    res.headers()
+                        .get(name)
+                        .map(|value| value == "no-cache")
+                        .unwrap_or(true)
+                } else {
+                    !res.headers().contains_key(name)
+                };
+                if should_insert {
+                    res.headers_mut().insert(name, value.clone());
+                }
+            }
             Ok(res)
         })
     }

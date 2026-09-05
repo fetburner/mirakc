@@ -106,6 +106,34 @@ where
     S: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
     D: Send + Unpin + 'static,
 {
+    let additional_headers = HeaderMap::new();
+    streaming_with_headers(
+        config,
+        spawner,
+        stream,
+        filters,
+        params,
+        stop_triggers,
+        &additional_headers,
+    )
+    .await
+}
+
+pub(in crate::web::api) async fn streaming_with_headers<W, T, S, D>(
+    config: &Config,
+    spawner: &W,
+    stream: MpegTsStream<T, S>,
+    filters: Vec<String>,
+    params: &StreamingHeaderParams,
+    stop_triggers: D,
+    additional_headers: &HeaderMap,
+) -> Result<Response, Error>
+where
+    W: Spawn,
+    T: fmt::Display + Clone + Send + Unpin + 'static,
+    S: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
+    D: Send + Unpin + 'static,
+{
     let time_limit = config.server.stream_time_limit;
 
     if filters.is_empty() {
@@ -114,6 +142,7 @@ where
             params,
             stop_triggers,
             config.server.stream_time_limit,
+            additional_headers,
         )
         .await
     } else {
@@ -169,7 +198,14 @@ where
         });
 
         let stream = ReceiverStream::new(receiver);
-        do_streaming(stream, params, stop_triggers, time_limit).await
+        do_streaming(
+            stream,
+            params,
+            stop_triggers,
+            time_limit,
+            additional_headers,
+        )
+        .await
     }
 }
 
@@ -178,6 +214,7 @@ async fn do_streaming<S, D>(
     params: &StreamingHeaderParams,
     stop_trigger: D,
     time_limit: u64,
+    additional_headers: &HeaderMap,
 ) -> Result<Response, Error>
 where
     S: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
@@ -197,7 +234,8 @@ where
         }
         Err(_) => Err(Error::StreamingTimedOut),
         Ok(_) => {
-            let headers = build_headers(params);
+            let mut headers = build_headers(params);
+            headers.extend(additional_headers.clone());
             let body = StreamBody::new(peekable.map_ok(Frame::data).map_err(Error::from));
             if let Some(ref range) = params.range {
                 let body = SeekableStreamBody::new(body, range.bytes());
@@ -246,7 +284,16 @@ fn build_headers(params: &StreamingHeaderParams) -> HeaderMap {
 pub(in crate::web::api) fn do_head_stream(
     params: &StreamingHeaderParams,
 ) -> Result<Response, Error> {
-    let headers = build_headers(params);
+    let additional_headers = HeaderMap::new();
+    do_head_stream_with_headers(params, &additional_headers)
+}
+
+pub(in crate::web::api) fn do_head_stream_with_headers(
+    params: &StreamingHeaderParams,
+    additional_headers: &HeaderMap,
+) -> Result<Response, Error> {
+    let mut headers = build_headers(params);
+    headers.extend(additional_headers.clone());
 
     // It's a dirt hack...
     //
@@ -292,11 +339,26 @@ mod tests {
             range: None,
             user: user_for_test(0.into()),
         };
+        let additional_headers = HeaderMap::new();
 
-        let result = do_streaming(futures::stream::empty(), &params, (), 1000).await;
+        let result = do_streaming(
+            futures::stream::empty(),
+            &params,
+            (),
+            1000,
+            &additional_headers,
+        )
+        .await;
         assert_matches!(result, Err(Error::ProgramNotFound));
 
-        let result = do_streaming(futures::stream::pending(), &params, (), 1).await;
+        let result = do_streaming(
+            futures::stream::pending(),
+            &params,
+            (),
+            1,
+            &additional_headers,
+        )
+        .await;
         assert_matches!(result, Err(Error::StreamingTimedOut));
     }
 

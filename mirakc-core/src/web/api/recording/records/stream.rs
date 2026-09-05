@@ -1,11 +1,24 @@
 use super::*;
 
+use std::time::Duration as StdDuration;
+use std::time::SystemTime;
+
+use axum::http::HeaderMap;
+use axum::http::header::IF_NONE_MATCH;
+use axum_extra::headers::CacheControl;
+use axum_extra::headers::ETag;
+use axum_extra::headers::HeaderMapExt;
+use axum_extra::headers::IfModifiedSince;
+use axum_extra::headers::IfNoneMatch;
+use axum_extra::headers::IfRange;
+use axum_extra::headers::LastModified;
+
 use crate::recording::Record;
 use crate::web::api::stream::StreamingHeaderParams;
 use crate::web::api::stream::compute_content_length;
 use crate::web::api::stream::compute_content_range;
-use crate::web::api::stream::do_head_stream;
-use crate::web::api::stream::streaming;
+use crate::web::api::stream::do_head_stream_with_headers;
+use crate::web::api::stream::streaming_with_headers;
 
 /// Gets a media stream of the content of a record.
 ///
@@ -16,6 +29,7 @@ use crate::web::api::stream::streaming;
 /// A request for a record without content file always returns status code 204.
 ///
 /// A range request with filters always causes an error response with status code 400.
+#[allow(clippy::too_many_arguments)]
 #[utoipa::path(
     get,
     path = "/recording/records/{id}/stream",
@@ -38,7 +52,11 @@ pub(in crate::web::api) async fn get<R, W>(
     State(ConfigExtractor(config)): State<ConfigExtractor>,
     State(SpawnerExtractor(spawner)): State<SpawnerExtractor<W>>,
     Path(id): Path<RecordId>,
+    request_headers: HeaderMap,
     ranges: Option<TypedHeader<axum_extra::headers::Range>>,
+    if_none_match: Option<TypedHeader<IfNoneMatch>>,
+    if_modified_since: Option<TypedHeader<IfModifiedSince>>,
+    if_range: Option<TypedHeader<IfRange>>,
     user: TunerUser,
     Qs(filter_setting): Qs<FilterSetting>,
 ) -> Result<Response, Error>
@@ -57,8 +75,29 @@ where
     };
 
     let (filters, content_type, seekable) = build_filters(&config, &filter_setting, &record)?;
+    let validator = build_validator(&record, filters.is_empty());
+    let last_modified = build_last_modified(&record);
+    let cache_headers = build_cache_headers(&record, validator.as_ref(), last_modified.as_ref());
+
+    if is_not_modified(
+        validator.as_ref(),
+        last_modified.as_ref(),
+        &if_none_match,
+        &if_modified_since,
+        request_headers.contains_key(IF_NONE_MATCH),
+    ) {
+        return Ok((StatusCode::NOT_MODIFIED, cache_headers).into_response());
+    }
+
     let incomplete = matches!(record.recording_status, RecordingStatus::Recording);
-    let range = compute_content_range(&ranges, content_length, incomplete, seekable)?;
+    let range = match (&if_range, &validator) {
+        (Some(TypedHeader(if_range)), _)
+            if if_range.is_modified(validator.as_ref(), last_modified.as_ref()) =>
+        {
+            None
+        }
+        _ => compute_content_range(&ranges, content_length, incomplete, seekable)?,
+    };
     let length = compute_content_length(content_length, incomplete, range.as_ref());
 
     let params = StreamingHeaderParams {
@@ -76,9 +115,19 @@ where
         ))
         .await??;
 
-    streaming(&config, &spawner, stream, filters, &params, stop_trigger).await
+    streaming_with_headers(
+        &config,
+        &spawner,
+        stream,
+        filters,
+        &params,
+        stop_trigger,
+        &cache_headers,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[utoipa::path(
     head,
     path = "/recording/records/{id}/stream",
@@ -99,7 +148,11 @@ pub(in crate::web::api) async fn head<R>(
     State(RecordingManagerExtractor(recording_manager)): State<RecordingManagerExtractor<R>>,
     State(ConfigExtractor(config)): State<ConfigExtractor>,
     Path(id): Path<RecordId>,
+    request_headers: HeaderMap,
     ranges: Option<TypedHeader<axum_extra::headers::Range>>,
+    if_none_match: Option<TypedHeader<IfNoneMatch>>,
+    if_modified_since: Option<TypedHeader<IfModifiedSince>>,
+    if_range: Option<TypedHeader<IfRange>>,
     user: TunerUser,
     Qs(filter_setting): Qs<FilterSetting>,
 ) -> Result<Response, Error>
@@ -115,9 +168,30 @@ where
         _ => return Err(Error::NoContent),
     };
 
-    let (_, content_type, seekable) = build_filters(&config, &filter_setting, &record)?;
+    let (filters, content_type, seekable) = build_filters(&config, &filter_setting, &record)?;
+    let validator = build_validator(&record, filters.is_empty());
+    let last_modified = build_last_modified(&record);
+    let cache_headers = build_cache_headers(&record, validator.as_ref(), last_modified.as_ref());
+
+    if is_not_modified(
+        validator.as_ref(),
+        last_modified.as_ref(),
+        &if_none_match,
+        &if_modified_since,
+        request_headers.contains_key(IF_NONE_MATCH),
+    ) {
+        return Ok((StatusCode::NOT_MODIFIED, cache_headers).into_response());
+    }
+
     let incomplete = matches!(record.recording_status, RecordingStatus::Recording);
-    let range = compute_content_range(&ranges, content_length, incomplete, seekable)?;
+    let range = match (&if_range, &validator) {
+        (Some(TypedHeader(if_range)), _)
+            if if_range.is_modified(validator.as_ref(), last_modified.as_ref()) =>
+        {
+            None
+        }
+        _ => compute_content_range(&ranges, content_length, incomplete, seekable)?,
+    };
     let length = compute_content_length(content_length, incomplete, range.as_ref());
 
     let params = StreamingHeaderParams {
@@ -128,7 +202,72 @@ where
         user,
     };
 
-    do_head_stream(&params)
+    do_head_stream_with_headers(&params, &cache_headers)
+}
+
+fn build_validator(record: &Record, filters_are_empty: bool) -> Option<ETag> {
+    record
+        .content_sha256
+        .as_deref()
+        .filter(|_| filters_are_empty)
+        .and_then(|hash| format!("\"{hash}\"").parse().ok())
+}
+
+fn build_last_modified(record: &Record) -> Option<LastModified> {
+    record
+        .recording_end_time
+        .map(|time| LastModified::from(SystemTime::from(time)))
+}
+
+fn build_cache_headers(
+    record: &Record,
+    validator: Option<&ETag>,
+    last_modified: Option<&LastModified>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    if let Some(validator) = validator {
+        headers.typed_insert(validator.clone());
+    }
+    if let Some(last_modified) = last_modified {
+        headers.typed_insert(*last_modified);
+    }
+
+    let cache_control = if matches!(record.recording_status, RecordingStatus::Recording) {
+        CacheControl::new().with_no_store()
+    } else {
+        CacheControl::new()
+            .with_private()
+            .with_max_age(StdDuration::from_secs(365 * 24 * 60 * 60))
+            .with_immutable()
+    };
+    headers.typed_insert(cache_control);
+
+    headers
+}
+
+fn is_not_modified(
+    validator: Option<&ETag>,
+    last_modified: Option<&LastModified>,
+    if_none_match: &Option<TypedHeader<IfNoneMatch>>,
+    if_modified_since: &Option<TypedHeader<IfModifiedSince>>,
+    if_none_match_present: bool,
+) -> bool {
+    if if_none_match_present {
+        let Some(TypedHeader(if_none_match)) = if_none_match else {
+            return false;
+        };
+        return validator
+            .map(|validator| !if_none_match.precondition_passes(validator))
+            .unwrap_or(false);
+    }
+
+    match (if_modified_since, last_modified) {
+        (Some(TypedHeader(if_modified_since)), Some(last_modified)) => {
+            !if_modified_since.is_modified(SystemTime::from(*last_modified))
+        }
+        _ => false,
+    }
 }
 
 fn build_filters(

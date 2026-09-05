@@ -223,9 +223,12 @@ macro_rules! record {
             Option::<DateTime<Jst>>::None
         )
     };
-    (finished: $id:expr) => {
-        record!($id, RecordingStatus::Finished, Jst::now(), Some(Jst::now()))
-    };
+    (finished: $id:expr) => {{
+        let mut record = record!($id, RecordingStatus::Finished, Jst::now(), Some(Jst::now()));
+        record.content_sha256 =
+            Some("84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882".to_owned());
+        record
+    }};
     ($id:expr, $status:expr, $start_time:expr, $end_time:expr) => {
         Record {
             id: $id.to_string().into(),
