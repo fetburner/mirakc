@@ -2278,24 +2278,6 @@ impl ContentSource {
         let id = record.id.clone();
         let content_path_str = content_path.to_str().unwrap();
         let kind = match (range, &record.recording_status) {
-            (Some(range), _) => {
-                debug_assert!(range.is_partial());
-                let mut file = tokio::fs::File::open(&content_path).await.map_err(|e| {
-                    tracing::warn!(?content_path, %e, "Failed to open content file");
-                    Error::NoContent
-                })?;
-                // Seeking past the end of the file is not an error, and reading from there yields
-                // no bytes.  That matches what `dd ibs=1 skip=N` did, and it is reachable:
-                // `ContentRange::without_size`, used while recording when the content length is
-                // not yet known, does not bounds-check `first`.
-                tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(range.first()))
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(?content_path, %e, "Failed to seek content file");
-                        Error::NoContent
-                    })?;
-                ContentSourceKind::File(Some(tokio::io::AsyncReadExt::take(file, range.bytes())))
-            }
             (None, RecordingStatus::Recording) => {
                 // We use `tail -f` for streaming during recording in order to send data to be
                 // appended to the content file in the future after the stream reaches EOF at that
@@ -2306,24 +2288,47 @@ impl ContentSource {
                 let cmd = format!("tail -f -c +0 '{content_path_str}'");
                 ContentSourceKind::Pipeline(spawn_pipeline(vec![cmd], id.clone(), "content", ctx)?)
             }
+            // Both a range request and a whole-content request are a seek followed by a limited
+            // read.  A request without a range is simply the degenerate case of that: start at the
+            // beginning and take everything.
             _ => {
-                let cmd = format!("cat '{content_path_str}'");
-                ContentSourceKind::Pipeline(spawn_pipeline(vec![cmd], id.clone(), "content", ctx)?)
+                let (first, count) = match range {
+                    Some(range) => {
+                        debug_assert!(range.is_partial());
+                        (range.first(), range.bytes())
+                    }
+                    None => (0, u64::MAX),
+                };
+                let mut file = tokio::fs::File::open(&content_path).await.map_err(|e| {
+                    tracing::warn!(?content_path, %e, "Failed to open content file");
+                    Error::NoContent
+                })?;
+                // Seeking past the end of the file is not an error, and reading from there yields
+                // no bytes.  That matches what `dd ibs=1 skip=N` did, and it is reachable:
+                // `ContentRange::without_size`, used while recording when the content length is
+                // not yet known, does not bounds-check `first`.
+                tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(first))
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(?content_path, %e, "Failed to seek content file");
+                        Error::NoContent
+                    })?;
+                ContentSourceKind::File(Some(tokio::io::AsyncReadExt::take(file, count)))
             }
         };
 
         Ok(Self { id, kind })
     }
 
-    fn create_stream(&mut self, time_limit: u64) -> ContentStream {
-        // 32 KiB, large enough for 10 ms buffering.
-        const CHUNK_SIZE: usize = 4096 * 8;
+    // 32 KiB, large enough for 10 ms buffering.
+    const CHUNK_SIZE: usize = 4096 * 8;
 
+    fn create_stream(&mut self, time_limit: u64) -> ContentStream {
         // TODO(#2057): ranges
         match &mut self.kind {
             ContentSourceKind::Pipeline(pipeline) => {
                 let (_, output) = pipeline.take_endpoints();
-                let stream = ReaderStream::with_capacity(output, CHUNK_SIZE)
+                let stream = ReaderStream::with_capacity(output, Self::CHUNK_SIZE)
                     // We set a time limit in order to stop streaming when the stream reaches the
                     // *true* EOF.  Because `tail -f` doesn't terminate when the stream reaches an
                     // EOF at that point.
@@ -2340,9 +2345,9 @@ impl ContentSource {
                 // No time limit here, unlike the pipeline above.  The time limit exists solely
                 // because `tail -f` never terminates on its own; reading a regular file ends at
                 // EOF.  The previous implementation streamed every case through a pipeline and so
-                // applied the limit to `dd` as well, which meant a storage stall longer than the
-                // limit silently truncated the response instead of delaying it.
-                let stream = ReaderStream::with_capacity(reader, CHUNK_SIZE);
+                // applied the limit to `cat` and `dd` as well, which meant a storage stall longer
+                // than the limit silently truncated the response instead of delaying it.
+                let stream = ReaderStream::with_capacity(reader, Self::CHUNK_SIZE);
                 MpegTsStream::new(self.id.clone(), Box::pin(stream))
             }
         }
@@ -4259,14 +4264,7 @@ mod tests {
         let mut source = ContentSource::new(&config, &record, None, &ctx)
             .await
             .unwrap();
-        assert_matches!(&source.kind, ContentSourceKind::Pipeline(pipeline) => {
-            let models = pipeline.get_model();
-            assert_eq!(models.len(), 1);
-            assert_matches!(models[0], CommandPipelineProcessModel { ref command, pid } => {
-                assert_eq!(*command, format!("cat '{content_path_str}'"));
-                assert!(pid.is_some());
-            });
-        });
+        assert_matches!(&source.kind, ContentSourceKind::File(Some(_)));
         let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut content = String::new();
@@ -4291,9 +4289,9 @@ mod tests {
     }
 
     // The content used in `test_content_source_create_stream` is 10 bytes, far smaller than
-    // CHUNK_SIZE, so it never exercises a range that spans multiple chunks.
+    // CHUNK_SIZE, so it never exercises a stream that spans multiple chunks.
     #[test(tokio::test)]
-    async fn test_content_source_create_stream_range_spanning_chunks() {
+    async fn test_content_source_create_stream_spanning_chunks() {
         let temp_dir = TempDir::new().unwrap();
         let config = config_for_test(temp_dir.path());
 
@@ -4303,16 +4301,28 @@ mod tests {
         let record = record!(finished: id.value());
 
         // Deliberately not a multiple of CHUNK_SIZE so that the last chunk is partial.
-        const LEN: usize = 4096 * 8 * 2 + 1234;
-        let content: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let len = ContentSource::CHUNK_SIZE * 2 + 1234;
+        let content: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
 
         let content_path = make_content_path(&config, &record).unwrap();
         tokio::fs::write(&content_path, &content).await.unwrap();
 
+        // The whole content, w/o range.
+        let mut source = ContentSource::new(&config, &record, None, &ctx)
+            .await
+            .unwrap();
+        let stream = source.create_stream(1000);
+        let mut reader = tokio_util::io::StreamReader::new(stream);
+        let mut got = Vec::new();
+        assert_matches!(reader.read_to_end(&mut got).await, Ok(size) => {
+            assert_eq!(size, len);
+        });
+        assert_eq!(got, content);
+
         // A range spanning several chunks, starting at an offset that is not chunk-aligned.
-        let first = 4096 * 8 + 777;
-        let last = LEN - 999;
-        let range = Some(ContentRange::with_size(first as u64, last as u64, LEN as u64).unwrap());
+        let first = ContentSource::CHUNK_SIZE + 777;
+        let last = len - 999;
+        let range = Some(ContentRange::with_size(first as u64, last as u64, len as u64).unwrap());
         let mut source = ContentSource::new(&config, &record, range.as_ref(), &ctx)
             .await
             .unwrap();
