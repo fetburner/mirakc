@@ -2257,6 +2257,14 @@ impl std::fmt::Debug for ContentSourceKind {
     }
 }
 
+// The content can be removed between the existence check and opening or seeking it.
+fn content_file_error(err: std::io::Error) -> Error {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => Error::NoContent,
+        _ => Error::IoError(err),
+    }
+}
+
 struct ContentSource {
     id: RecordId,
     kind: ContentSourceKind,
@@ -2282,17 +2290,21 @@ impl ContentSource {
                 debug_assert!(range.is_partial());
                 let mut file = tokio::fs::File::open(&content_path).await.map_err(|e| {
                     tracing::warn!(?content_path, %e, "Failed to open content file");
-                    Error::NoContent
+                    content_file_error(e)
                 })?;
                 // Seeking past the end of the file is not an error, and reading from there yields
-                // no bytes.  That matches what `dd ibs=1 skip=N` did, and it is reachable:
-                // `ContentRange::without_size`, used while recording when the content length is
-                // not yet known, does not bounds-check `first`.
+                // no bytes.  That matches what `dd ibs=1 skip=N` did.
+                //
+                // The HTTP layer normalizes ranges against the known content length before we get
+                // here, so a range past the end doesn't arrive through it.  We keep the `dd`
+                // behaviour anyway, for ranges built directly from `ContentRange::without_size`
+                // (which checks `first <= last` but holds no content length to check against) and
+                // for a file that shrinks after its length was read.
                 tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(range.first()))
                     .await
                     .map_err(|e| {
                         tracing::warn!(?content_path, %e, "Failed to seek content file");
-                        Error::NoContent
+                        content_file_error(e)
                     })?;
                 ContentSourceKind::File(Some(tokio::io::AsyncReadExt::take(file, range.bytes())))
             }
@@ -2319,7 +2331,6 @@ impl ContentSource {
         // 32 KiB, large enough for 10 ms buffering.
         const CHUNK_SIZE: usize = 4096 * 8;
 
-        // TODO(#2057): ranges
         match &mut self.kind {
             ContentSourceKind::Pipeline(pipeline) => {
                 let (_, output) = pipeline.take_endpoints();
@@ -2817,6 +2828,17 @@ mod tests {
 
     const RECORDING_DIR: &str = "recording";
     const RECORDS_DIR: &str = ".records";
+
+    #[test]
+    fn test_content_file_error() {
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_matches!(content_file_error(err), Error::NoContent);
+
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_matches!(content_file_error(err), Error::IoError(err) => {
+            assert_matches!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        });
+    }
 
     #[test]
     fn test_record_id() {
@@ -3692,8 +3714,6 @@ mod tests {
             drop(stop_trigger);
         }
         system.shutdown().await;
-
-        // TODO(#2057): range request
     }
 
     #[test(tokio::test)]
@@ -3741,8 +3761,6 @@ mod tests {
             drop(stop_trigger);
         }
         system.shutdown().await;
-
-        // TODO(#2057): range request
     }
 
     #[test(tokio::test)]
@@ -3784,8 +3802,6 @@ mod tests {
             });
         }
         system.shutdown().await;
-
-        // TODO(#2057): range request
     }
 
     #[test(tokio::test)]
@@ -4325,11 +4341,11 @@ mod tests {
         assert_eq!(got, content[first..=last]);
     }
 
-    // `ContentRange::with_size` rejects a range that runs past the end of the content, but
-    // `ContentRange::without_size` -- used while recording, when the content length is not yet
-    // known -- performs no such check.  A range past the end of the file is therefore reachable,
-    // and it has to behave the way `dd ibs=1 skip=N count=M` did: return whatever is available
-    // and stop, rather than fail.
+    // HTTP ranges are normalized against the known content length before reaching
+    // `ContentSource`.  This covers ranges built directly with `ContentRange::without_size`, which
+    // checks `first <= last` but has no content length to check against, and the case where a file
+    // shrinks after its length is read.  Both have to keep the old `dd` behavior: return whatever
+    // is available and stop, rather than fail.
     #[test(tokio::test)]
     async fn test_content_source_create_stream_range_past_eof() {
         let temp_dir = TempDir::new().unwrap();
