@@ -51,6 +51,7 @@ use crate::models::TunerUser;
 use crate::models::TunerUserInfo;
 use crate::mpeg_ts_stream::MpegTsStream;
 use crate::onair;
+use crate::tuner;
 use crate::tuner::StartStreaming;
 use crate::tuner::StopStreaming;
 use crate::tuner::TunerSubscriptionId;
@@ -186,8 +187,19 @@ impl<T, E, O> RecordingManager<T, E, O> {
         if let Some(token) = self.timer_token.take() {
             token.cancel();
         }
-        if let Some(schedule) = self.queue.peek() {
-            let expires_at = schedule.start_at - Duration::try_seconds(PREP_SECS).unwrap();
+        let expires_at = self
+            .queue
+            .peek()
+            .map(|schedule| schedule.start_at - Duration::try_seconds(PREP_SECS).unwrap())
+            .into_iter()
+            .chain(
+                self.schedules
+                    .values()
+                    .filter(|schedule| matches!(schedule.state, RecordingScheduleState::Waiting))
+                    .filter_map(RecordingSchedule::tuner_wait_deadline),
+            )
+            .min();
+        if let Some(expires_at) = expires_at {
             let duration = match (expires_at - Jst::now()).to_std() {
                 Ok(duration) => {
                     tracing::debug!(%expires_at, "Set timer");
@@ -329,6 +341,7 @@ impl<T, E, O> Actor for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -343,6 +356,15 @@ where
 
         if !self.config.recording.is_enabled() {
             tracing::info!("Recording is disabled");
+            return;
+        }
+
+        if let Err(err) = self
+            .tuner_manager
+            .call(tuner::RegisterEmitter(ctx.emitter()))
+            .await
+        {
+            tracing::error!(?err, "Failed to register emitter for tuner::StatusChanged");
             return;
         }
 
@@ -398,6 +420,7 @@ impl<T, E, O> Handler<QueryRecordingSchedules> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -452,6 +475,7 @@ impl<T, E, O> Handler<QueryRecordingSchedule> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -493,6 +517,7 @@ impl<T, E, O> Handler<AddRecordingSchedule> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -599,6 +624,7 @@ impl<T, E, O> Handler<RemoveRecordingSchedule> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -688,6 +714,7 @@ impl<T, E, O> Handler<RemoveRecordingSchedules> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -748,7 +775,7 @@ impl<T, E, O> RecordingManager<T, E, O> {
                     // (or have already started).
                     start_time - now <= prep_time
                 }
-                Tracking | Recording => {
+                Tracking | Waiting | Recording => {
                     // Always retained.
                     true
                 }
@@ -772,6 +799,7 @@ impl<T, E, O> Handler<QueryRecordingRecorders> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -807,6 +835,7 @@ impl<T, E, O> Handler<QueryRecordingRecorder> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -842,6 +871,7 @@ impl<T, E, O> Handler<StartRecording> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -886,6 +916,7 @@ impl<T, E, O> Handler<StopRecording> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -929,6 +960,7 @@ impl<T, E, O> Handler<ProcessRecording> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -947,6 +979,8 @@ where
             self.rebuild_queue();
         }
 
+        changed |= self.expire_waiting_schedules(now).await;
+
         let program_ids = self.dequeue_next_schedules(now);
         if !program_ids.is_empty() {
             changed = true;
@@ -961,6 +995,51 @@ where
         if changed {
             self.save_schedules();
         }
+    }
+}
+
+#[async_trait]
+impl<T, E, O> Handler<tuner::Event> for RecordingManager<T, E, O>
+where
+    T: Clone + Send + Sync + 'static,
+    T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
+    T: TriggerFactory<StopStreaming>,
+    E: Send + Sync + 'static,
+    E: Call<QueryClock>,
+    E: Call<QueryPrograms>,
+    E: Call<QueryService>,
+    E: Call<epg::RegisterEmitter>,
+    O: Clone + Send + Sync + 'static,
+    O: Call<onair::RegisterEmitter>,
+{
+    async fn handle(&mut self, _msg: tuner::Event, ctx: &mut Context<Self>) {
+        let mut waiting = self
+            .schedules
+            .values()
+            .filter(|schedule| matches!(schedule.state, RecordingScheduleState::Waiting))
+            .map(|schedule| {
+                (
+                    schedule.program.id,
+                    schedule.options.priority,
+                    schedule.program.start_at,
+                )
+            })
+            .collect_vec();
+        if waiting.is_empty() {
+            return;
+        }
+
+        // Wake waiters in priority order so that a higher-priority schedule gets
+        // the freed tuner first. `activate_tuner` re-arbitrates on every retry.
+        waiting.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+
+        for (program_id, _, _) in waiting {
+            self.start_recording(program_id, ctx.address().clone(), ctx)
+                .await;
+        }
+        self.set_timer(ctx);
+        self.save_schedules();
     }
 }
 
@@ -981,7 +1060,7 @@ impl<T, E, O> RecordingManager<T, E, O> {
                 return true;
             }
             match schedule.state {
-                Scheduled | Tracking | Rescheduling => {
+                Scheduled | Tracking | Waiting | Rescheduling => {
                     tracing::error!(
                         %schedule.program.id,
                         "Schedule expired",
@@ -1006,6 +1085,39 @@ impl<T, E, O> RecordingManager<T, E, O> {
         self.schedules.len() != len
     }
 
+    async fn expire_waiting_schedules(&mut self, now: DateTime<Jst>) -> bool {
+        let expired = self
+            .schedules
+            .values()
+            .filter(|schedule| matches!(schedule.state, RecordingScheduleState::Waiting))
+            .filter(|schedule| {
+                schedule
+                    .tuner_wait_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|schedule| schedule.program.id)
+            .collect_vec();
+
+        for program_id in expired.iter().copied() {
+            tracing::error!(%program_id, "Recording deadline expired while waiting for a tuner");
+            self.fail_start(
+                program_id,
+                "Recording ended before a tuner became available".to_string(),
+            )
+            .await;
+        }
+        !expired.is_empty()
+    }
+
+    async fn fail_start(&mut self, program_id: ProgramId, message: String) {
+        let reason = RecordingFailedReason::StartRecordingFailed { message };
+        if let Some(schedule) = self.schedules.get_mut(&program_id) {
+            schedule.state = RecordingScheduleState::Failed;
+            schedule.failed_reason = Some(reason.clone());
+        }
+        self.emit_recording_failed(program_id, reason).await;
+    }
+
     fn dequeue_next_schedules(&mut self, now: DateTime<Jst>) -> Vec<ProgramId> {
         let mut program_ids = vec![];
         let prep_secs = Duration::try_seconds(PREP_SECS).unwrap();
@@ -1026,6 +1138,7 @@ impl<T, E, O> RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1048,20 +1161,22 @@ where
                     "Start recording",
                 );
             }
+            Err(Error::TunerUnavailable) => {
+                tracing::info!(
+                    schedule.program.id = %program_id,
+                    "No tuner available, waiting for one to become available",
+                );
+                if let Some(schedule) = self.schedules.get_mut(&program_id) {
+                    schedule.state = RecordingScheduleState::Waiting;
+                }
+            }
             Err(err) => {
                 tracing::error!(
                     %err,
                     schedule.program.id = %program_id,
                     "Failed to start recording",
                 );
-                let reason = RecordingFailedReason::StartRecordingFailed {
-                    message: format!("{err}"),
-                };
-                if let Some(schedule) = self.schedules.get_mut(&program_id) {
-                    schedule.state = RecordingScheduleState::Failed;
-                    schedule.failed_reason = Some(reason.clone());
-                }
-                self.emit_recording_failed(program_id, reason).await;
+                self.fail_start(program_id, format!("{err}")).await;
             }
         }
     }
@@ -1245,6 +1360,7 @@ impl<T, E, O> Handler<QueryRecords> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1296,6 +1412,7 @@ impl<T, E, O> Handler<QueryRecord> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1340,6 +1457,7 @@ impl<T, E, O> Handler<RemoveRecord> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1448,6 +1566,7 @@ impl<T, E, O> Handler<OpenContent> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1517,6 +1636,7 @@ impl<T, E, O> Handler<RegisterEmitter> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1621,6 +1741,7 @@ impl<T, E, O> Handler<RegisterEmitterPostProcess> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1658,6 +1779,7 @@ impl<T, E, O> Handler<UnregisterEmitter> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1722,6 +1844,7 @@ impl<T, E, O> Handler<RecordingStarted> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1760,6 +1883,7 @@ impl<T, E, O> Handler<RecordingStopped> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -1899,6 +2023,7 @@ impl<T, E, O> Handler<RecordingFailed> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -2006,6 +2131,7 @@ impl<T, E, O> Handler<epg::ServicesUpdated> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -2074,6 +2200,7 @@ impl<T, E, O> Handler<epg::ProgramsUpdated> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -2167,6 +2294,7 @@ impl<T, E, O> Handler<onair::OnairProgramChanged> for RecordingManager<T, E, O>
 where
     T: Clone + Send + Sync + 'static,
     T: Call<StartStreaming>,
+    T: Call<tuner::RegisterEmitter>,
     T: TriggerFactory<StopStreaming>,
     E: Send + Sync + 'static,
     E: Call<QueryClock>,
@@ -2220,6 +2348,9 @@ impl<T, E, O> RecordingManager<T, E, O> {
                 }
                 Tracking => {
                     rescheduled = schedule.program.start_at != program.start_at;
+                    schedule.program = (*program).clone();
+                }
+                Waiting => {
                     schedule.program = (*program).clone();
                 }
                 Recording => {
@@ -2381,7 +2512,7 @@ impl RecordingSchedule {
 
     fn can_be_updated_by_epg(&self) -> bool {
         use RecordingScheduleState::*;
-        matches!(self.state, Scheduled | Rescheduling)
+        matches!(self.state, Scheduled | Waiting | Rescheduling)
     }
 
     fn is_ready_for_recording(&self) -> bool {
@@ -2393,9 +2524,21 @@ impl RecordingSchedule {
         use RecordingScheduleState::*;
         matches!(self.state, Recording)
     }
+
+    fn tuner_wait_deadline(&self) -> Option<DateTime<Jst>> {
+        let start_at = self.program.start_at?;
+        let timeout_at = self
+            .options
+            .max_start_delay
+            .map(|timeout| start_at + timeout);
+        match (self.program.end_at(), timeout_at) {
+            (Some(end_at), Some(timeout_at)) => Some(end_at.min(timeout_at)),
+            (end_at, timeout_at) => end_at.or(timeout_at),
+        }
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[derive(ToSchema)]
 #[schema(title = "RecordingScheduleState")]
@@ -2406,6 +2549,11 @@ pub enum RecordingScheduleState {
     // schedule always transits to `recording` via `tracking`.
     Tracking,
     Recording,
+    // The recording is waiting for a tuner to become available.  When a tuner
+    // becomes available (a `tuner::Event::StatusChanged` is emitted), the
+    // recording is retried.  If no tuner becomes available until the end of the
+    // program, the recording fails.
+    Waiting,
     // When the recording fails, the schedule transits to this state.  If on-air
     // program tracker is available, the schedule may be rescheduled when an EIT
     // section ([schedule] or [p/f]) for the target TV program is emitted.
@@ -2415,6 +2563,37 @@ pub enum RecordingScheduleState {
     Finished,
     // The recording failed for some reason.
     Failed,
+}
+
+impl<'de> Deserialize<'de> for RecordingScheduleState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum State {
+            Scheduled,
+            Tracking,
+            Recording,
+            Waiting,
+            Rescheduling,
+            Finished,
+            Failed,
+            #[serde(other)]
+            Unknown,
+        }
+
+        Ok(match State::deserialize(deserializer)? {
+            State::Scheduled | State::Unknown => Self::Scheduled,
+            State::Tracking => Self::Tracking,
+            State::Recording => Self::Recording,
+            State::Waiting => Self::Waiting,
+            State::Rescheduling => Self::Rescheduling,
+            State::Finished => Self::Finished,
+            State::Failed => Self::Failed,
+        })
+    }
 }
 
 /// Recording options.
@@ -2451,6 +2630,18 @@ pub struct RecordingOptions {
     /// A list of post-filters to use.
     #[serde(default)]
     pub post_filters: Vec<String>,
+
+    /// The maximum delay after the scheduled start time to wait for a tuner.
+    ///
+    /// The recording fails when this delay or the program end time is reached,
+    /// whichever comes first. The value is serialized in milliseconds.
+    #[schema(value_type = Option<i64>)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "duration_milliseconds_option"
+    )]
+    pub max_start_delay: Option<Duration>,
 
     /// Log filter of the recording schedule.
     ///
@@ -2586,7 +2777,9 @@ impl Record {
         self.recording_duration = Some(now - self.recording_start_time);
 
         match schedule.state {
-            RecordingScheduleState::Scheduled | RecordingScheduleState::Tracking => (),
+            RecordingScheduleState::Scheduled
+            | RecordingScheduleState::Tracking
+            | RecordingScheduleState::Waiting => (),
             RecordingScheduleState::Recording => {
                 self.recording_status = RecordingStatus::Recording;
                 self.recording_end_time = None;
@@ -3124,6 +3317,160 @@ mod tests {
 
         manager.remove_schedules(RemovalTarget::All, now);
         assert!(manager.schedules.is_empty());
+    }
+
+    #[test(tokio::test)]
+    async fn test_waiting_for_tuner() {
+        let now = Jst::now();
+        let temp_dir = TempDir::new().unwrap();
+        let config = config_for_test(temp_dir.path());
+        let tuner = TunerManagerStub::default();
+        tuner.set_unavailable(true);
+
+        let system = System::new();
+        let manager = system
+            .spawn_actor(recording_manager!(
+                config,
+                tuner.clone(),
+                EpgStub,
+                OnairProgramManagerStub
+            ))
+            .await;
+        let program_id = ProgramId::from((0, 1, 1));
+        let result = manager
+            .call(StartRecording {
+                schedule: recording_schedule!(
+                    RecordingScheduleState::Scheduled,
+                    program!(program_id, now, "1h"),
+                    service!((0, 1), "sv", channel_gr!("ch", "ch")),
+                    recording_options!("1.m2ts", 0)
+                ),
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(())));
+        assert_matches!(
+            manager.call(QueryRecordingSchedule { program_id }).await,
+            Ok(Ok(schedule)) if matches!(schedule.state, RecordingScheduleState::Waiting)
+        );
+
+        tuner.set_unavailable(false);
+        manager.emit(tuner::Event::StatusChanged(0)).await;
+        assert_matches!(
+            manager.call(QueryRecordingSchedule { program_id }).await,
+            Ok(Ok(schedule)) if matches!(schedule.state, RecordingScheduleState::Recording)
+        );
+        system.shutdown().await;
+    }
+
+    #[test(tokio::test)]
+    async fn test_waiting_for_tuner_expires() {
+        let now = Jst::now();
+        let temp_dir = TempDir::new().unwrap();
+        let config = config_for_test(temp_dir.path());
+        let tuner = TunerManagerStub::default();
+        tuner.set_unavailable(true);
+
+        let system = System::new();
+        let manager = system
+            .spawn_actor(recording_manager!(
+                config,
+                tuner,
+                EpgStub,
+                OnairProgramManagerStub
+            ))
+            .await;
+        let program_id = ProgramId::from((0, 1, 1));
+        let result = manager
+            .call(StartRecording {
+                schedule: recording_schedule!(
+                    RecordingScheduleState::Scheduled,
+                    program!(program_id, now - Duration::try_hours(2).unwrap(), "1h"),
+                    service!((0, 1), "sv", channel_gr!("ch", "ch")),
+                    recording_options!("1.m2ts", 0)
+                ),
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(())));
+        manager.emit(ProcessRecording).await;
+        assert_matches!(
+            manager.call(QueryRecordingSchedule { program_id }).await,
+            Ok(Ok(schedule)) => {
+                assert_matches!(schedule.state, RecordingScheduleState::Failed);
+                assert_matches!(schedule.failed_reason, Some(RecordingFailedReason::StartRecordingFailed { .. }));
+            }
+        );
+        system.shutdown().await;
+    }
+
+    #[test]
+    fn test_waiting_state_forward_compat() {
+        // A state value unknown to this version (e.g. written by a newer version)
+        // deserializes to `Scheduled` instead of failing the whole load.
+        let state: RecordingScheduleState = serde_json::from_str("\"something-newer\"").unwrap();
+        assert_matches!(state, RecordingScheduleState::Scheduled);
+
+        // The new state round-trips.
+        assert_eq!(
+            serde_json::to_string(&RecordingScheduleState::Waiting).unwrap(),
+            "\"waiting\""
+        );
+        let state: RecordingScheduleState = serde_json::from_str("\"waiting\"").unwrap();
+        assert_matches!(state, RecordingScheduleState::Waiting);
+    }
+
+    #[test]
+    fn test_tuner_wait_deadline() {
+        use chrono::Duration as ChronoDuration;
+        let start = jst!("2026-01-01T10:00:00.000+09:00");
+
+        // No end time and no timeout: no deadline.
+        let schedule = recording_schedule!(
+            RecordingScheduleState::Scheduled,
+            program!((0, 1, 1), start),
+            service!((0, 1), "sv", channel_gr!("ch", "ch")),
+            recording_options!("1.m2ts", 0)
+        );
+        assert_matches!(schedule.tuner_wait_deadline(), None);
+
+        // End time only: deadline is the end time.
+        let schedule = recording_schedule!(
+            RecordingScheduleState::Scheduled,
+            program!((0, 1, 2), start, "1h"),
+            service!((0, 1), "sv", channel_gr!("ch", "ch")),
+            recording_options!("1.m2ts", 0)
+        );
+        assert_eq!(
+            schedule.tuner_wait_deadline(),
+            Some(start + ChronoDuration::try_hours(1).unwrap())
+        );
+
+        // Timeout shorter than the end time: deadline is start + timeout.
+        let mut options = recording_options!("1.m2ts", 0);
+        options.max_start_delay = Some(ChronoDuration::try_minutes(10).unwrap());
+        let schedule = recording_schedule!(
+            RecordingScheduleState::Scheduled,
+            program!((0, 1, 3), start, "1h"),
+            service!((0, 1), "sv", channel_gr!("ch", "ch")),
+            options
+        );
+        assert_eq!(
+            schedule.tuner_wait_deadline(),
+            Some(start + ChronoDuration::try_minutes(10).unwrap())
+        );
+
+        // Timeout longer than the end time: deadline is the end time.
+        let mut options = recording_options!("1.m2ts", 0);
+        options.max_start_delay = Some(ChronoDuration::try_hours(2).unwrap());
+        let schedule = recording_schedule!(
+            RecordingScheduleState::Scheduled,
+            program!((0, 1, 4), start, "1h"),
+            service!((0, 1), "sv", channel_gr!("ch", "ch")),
+            options
+        );
+        assert_eq!(
+            schedule.tuner_wait_deadline(),
+            Some(start + ChronoDuration::try_hours(1).unwrap())
+        );
     }
 
     #[test(tokio::test)]

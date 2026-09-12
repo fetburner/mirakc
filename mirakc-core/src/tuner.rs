@@ -1753,10 +1753,22 @@ mod tests {
 pub(crate) mod stub {
     use super::*;
     use bytes::Bytes;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub(crate) struct TunerManagerStub {
         expected_priority: Option<TunerUserPriority>,
+        unavailable: Arc<AtomicBool>,
+    }
+
+    impl Default for TunerManagerStub {
+        fn default() -> Self {
+            TunerManagerStub {
+                expected_priority: None,
+                unavailable: Arc::new(AtomicBool::new(false)),
+            }
+        }
     }
 
     impl TunerManagerStub {
@@ -1765,7 +1777,12 @@ pub(crate) mod stub {
                 expected_priority: test_config
                     .get("tuner_user_priority")
                     .map(|json| serde_json::from_str(json).unwrap()),
+                unavailable: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        pub fn set_unavailable(&self, unavailable: bool) {
+            self.unavailable.store(unavailable, Ordering::Relaxed);
         }
     }
 
@@ -1806,6 +1823,9 @@ pub(crate) mod stub {
         ) -> actlet::Result<<StartStreaming as Message>::Reply> {
             if let Some(expected_priority) = self.expected_priority {
                 assert_eq!(msg.user.priority, expected_priority);
+            }
+            if self.unavailable.load(Ordering::Relaxed) {
+                return Ok(Err(Error::TunerUnavailable));
             }
             if msg.channel.channel == "ch" {
                 let (tx, stream) = BroadcasterStream::new_for_test();

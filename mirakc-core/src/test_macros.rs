@@ -143,6 +143,7 @@ macro_rules! recording_options {
             priority: $priority.into(),
             pre_filters: vec![],
             post_filters: vec![],
+            max_start_delay: None,
             log_filter: None,
         }
     };
@@ -152,6 +153,7 @@ macro_rules! recording_options {
             priority: $priority.into(),
             pre_filters: vec![],
             post_filters: vec![],
+            max_start_delay: None,
             log_filter: None,
         }
     };
@@ -161,6 +163,7 @@ macro_rules! recording_options {
             priority: $priority.into(),
             pre_filters: vec![],
             post_filters: vec![],
+            max_start_delay: None,
             log_filter: Some($log_filter.into()),
         }
     };
