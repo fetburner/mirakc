@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use actlet::prelude::*;
 use bytes::Bytes;
@@ -22,10 +23,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
-use tokio::io::AsyncReadExt;
 use tokio::io::BufWriter;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
+use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
@@ -270,7 +271,7 @@ impl<T, E, O> RecordingManager<T, E, O> {
                         ) {
                             tracing::error!(?record_path, "inconsistent");
                         }
-                        record.update_by_schedule(&self.config, schedule).await;
+                        record.update_by_schedule(schedule, recorder.content_sha256.get().cloned());
                     }
                     None => {
                         // The schedule may have been removed before this method is called.
@@ -1173,21 +1174,31 @@ where
             }
         }
         let mut pipeline = builder.build(ctx)?;
-        let (input, mut output) = pipeline.take_endpoints();
+        let (input, output) = pipeline.take_endpoints();
 
         let fut = async move {
             let _ = stream.pipe(input).await;
         };
         ctx.spawn_task(fut);
 
+        let content_sha256 = Arc::new(OnceLock::new());
+
         // Inner future in order to capture the result in an outer future.
         let inner_fut = {
             let content_path = content_path.clone();
+            let content_sha256 = content_sha256.clone();
             async move {
                 let record = tokio::fs::File::create(&content_path).await?;
                 let mut writer = BufWriter::new(record);
+                // Compute the hash while writing so that we don't need to
+                // read the whole content again after the recording stopped.
+                let mut hasher = Sha256::new();
+                let mut reader = InspectReader::new(output, |chunk| hasher.update(chunk));
                 // TODO: use Stdio
-                tokio::io::copy(&mut output, &mut writer).await
+                tokio::io::copy(&mut reader, &mut writer).await?;
+                drop(reader);
+                let _ = content_sha256.set(format_sha256(hasher));
+                Ok::<_, std::io::Error>(())
             }
         };
         // Outer future emits messages to observers.
@@ -1214,6 +1225,7 @@ where
             pipeline,
             stop_trigger: Some(stop_trigger),
             content_type: content_type.clone(),
+            content_sha256,
         };
         self.recorders.insert(program_id, recorder);
         self.schedules.get_mut(&program_id).unwrap().state = RecordingScheduleState::Recording;
@@ -2540,6 +2552,8 @@ struct Recorder {
     pipeline: CommandPipeline<TunerSubscriptionId>,
     stop_trigger: Option<Trigger<StopStreaming>>,
     content_type: String,
+    // Set when the content has been written successfully.
+    content_sha256: Arc<OnceLock<String>>,
 }
 
 impl Recorder {
@@ -2638,7 +2652,7 @@ impl Record {
         }
     }
 
-    async fn update_by_schedule(&mut self, config: &Config, schedule: &RecordingSchedule) {
+    fn update_by_schedule(&mut self, schedule: &RecordingSchedule, content_sha256: Option<String>) {
         let now = Jst::now();
 
         self.program = schedule.program.clone();
@@ -2662,15 +2676,13 @@ impl Record {
             }
             RecordingScheduleState::Finished => {
                 self.recording_status = RecordingStatus::Finished;
-                let content_path = make_content_path(config, self).unwrap();
-                self.content_sha256 = compute_content_sha256(&content_path).await.ok();
+                self.content_sha256 = content_sha256;
             }
             RecordingScheduleState::Failed => {
                 self.recording_status = RecordingStatus::Failed {
                     reason: schedule.failed_reason.clone().unwrap(),
                 };
-                let content_path = make_content_path(config, self).unwrap();
-                self.content_sha256 = compute_content_sha256(&content_path).await.ok();
+                self.content_sha256 = content_sha256;
             }
         }
     }
@@ -2797,24 +2809,12 @@ fn glob_records(records_dir: &Path) -> impl Iterator<Item = PathBuf> {
         })
 }
 
-async fn compute_content_sha256(content_path: &Path) -> Result<String, Error> {
-    let mut file = tokio::fs::File::open(content_path).await?;
-
-    let mut hasher = Sha256::new();
-    let mut buf = [0; 4096];
-    loop {
-        let nread = file.read(&mut buf).await?;
-        if nread == 0 {
-            break;
-        }
-        hasher.update(&buf[..nread]);
-    }
-
-    Ok(hasher
+fn format_sha256(hasher: Sha256) -> String {
+    hasher
         .finalize()
         .into_iter()
         .map(|b| format!("{:02x}", b))
-        .collect::<String>())
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -3290,7 +3290,8 @@ mod tests {
                 assert_eq!(record.program.id, program_id);
                 // The recording stops when the system stops.
                 assert_matches!(record.recording_status, RecordingStatus::Finished);
-                assert!(record.content_sha256.is_some());
+                // The writing task is canceled before it reaches EOF.
+                assert!(record.content_sha256.is_none());
             });
         });
     }
@@ -3390,7 +3391,8 @@ mod tests {
                 assert_eq!(record.program.id, program_id);
                 // The recording stops when the system stops.
                 assert_matches!(record.recording_status, RecordingStatus::Finished);
-                assert!(record.content_sha256.is_some());
+                // The writing task is canceled before it reaches EOF.
+                assert!(record.content_sha256.is_none());
             });
         });
     }
@@ -3480,7 +3482,11 @@ mod tests {
                 assert_matches!(load_record(&config, &record_path).await, Ok((record, _)) => {
                     assert_eq!(record.program.id, program_id);
                     assert_matches!(record.recording_status, RecordingStatus::Finished);
-                    assert!(record.content_sha256.is_some());
+                    let content_path = make_content_path(&config, &record).unwrap();
+                    let content = std::fs::read(content_path).unwrap();
+                    let mut hasher = Sha256::new();
+                    hasher.update(&content);
+                    assert_eq!(record.content_sha256, Some(format_sha256(hasher)));
                 });
             });
         }

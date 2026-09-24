@@ -210,6 +210,7 @@ macro_rules! recorder {
             pipeline: $pipeline,
             stop_trigger: None,
             content_type: "video/MP2T".to_owned(),
+            content_sha256: Default::default(),
         }
     };
 }
