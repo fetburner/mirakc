@@ -78,6 +78,10 @@ pub struct RecordingManager<T, E, O> {
     queue: BinaryHeap<QueueItem>,
     schedules: HashMap<ProgramId, RecordingSchedule>,
     recorders: HashMap<ProgramId, Recorder>,
+    // Schedules waiting for a tuner released by one of `recorders`.
+    // ponytail: only own recorders wake them up, subscribe
+    // tuner::Event::StatusChanged if tuners held by others should be waited.
+    parked: Vec<ProgramId>,
     timer_token: Option<CancellationToken>,
 
     recording_started: EmitterRegistry<RecordingStarted>,
@@ -100,6 +104,7 @@ impl<T, E, O> RecordingManager<T, E, O> {
             queue: Default::default(),
             schedules: Default::default(),
             recorders: Default::default(),
+            parked: Default::default(),
             timer_token: None,
             recording_started: Default::default(),
             recording_stopped: Default::default(),
@@ -169,7 +174,8 @@ impl<T, E, O> RecordingManager<T, E, O> {
         let schedules = self
             .schedules
             .values()
-            .filter(|schedule| schedule.is_ready_for_recording());
+            .filter(|schedule| schedule.is_ready_for_recording())
+            .filter(|schedule| !self.parked.contains(&schedule.program.id));
         for schedule in schedules {
             self.queue.push(QueueItem {
                 program_id: schedule.program.id,
@@ -1048,22 +1054,80 @@ where
                     "Start recording",
                 );
             }
+            Err(Error::TunerUnavailable) if self.can_park(program_id) => {
+                tracing::warn!(
+                    schedule.program.id = %program_id,
+                    "No tuner available, wait for a recording to stop",
+                );
+                if !self.parked.contains(&program_id) {
+                    self.parked.push(program_id);
+                }
+            }
             Err(err) => {
                 tracing::error!(
                     %err,
                     schedule.program.id = %program_id,
                     "Failed to start recording",
                 );
-                let reason = RecordingFailedReason::StartRecordingFailed {
-                    message: format!("{err}"),
-                };
-                if let Some(schedule) = self.schedules.get_mut(&program_id) {
-                    schedule.state = RecordingScheduleState::Failed;
-                    schedule.failed_reason = Some(reason.clone());
-                }
-                self.emit_recording_failed(program_id, reason).await;
+                self.fail_to_start_recording(program_id, err).await;
             }
         }
+    }
+
+    // A tuner may be released when one of the recorders stops.
+    fn can_park(&self, program_id: ProgramId) -> bool {
+        !self.recorders.is_empty()
+            && self
+                .schedules
+                .get(&program_id)
+                .and_then(|schedule| schedule.program.end_at())
+                .is_some_and(|end_at| end_at > Jst::now())
+    }
+
+    async fn fail_to_start_recording(&mut self, program_id: ProgramId, err: Error) {
+        let reason = RecordingFailedReason::StartRecordingFailed {
+            message: format!("{err}"),
+        };
+        if let Some(schedule) = self.schedules.get_mut(&program_id) {
+            schedule.state = RecordingScheduleState::Failed;
+            schedule.failed_reason = Some(reason.clone());
+        }
+        self.emit_recording_failed(program_id, reason).await;
+    }
+
+    async fn retry_parked<C: Spawn>(&mut self, addr: Address<Self>, ctx: &C) -> bool {
+        let mut program_ids = std::mem::take(&mut self.parked);
+        // Schedules may have been removed or changed while parked.
+        program_ids.retain(|program_id| {
+            self.schedules
+                .get(program_id)
+                .is_some_and(|schedule| schedule.is_ready_for_recording())
+        });
+        if program_ids.is_empty() {
+            return false;
+        }
+        program_ids.sort_by_key(|program_id| {
+            let schedule = &self.schedules[program_id];
+            (
+                std::cmp::Reverse(schedule.options.priority),
+                schedule.program.start_at,
+            )
+        });
+        let now = Jst::now();
+        for program_id in program_ids.into_iter() {
+            let end_at = self.schedules[&program_id].program.end_at();
+            if end_at.is_none_or(|end_at| end_at <= now) {
+                tracing::error!(
+                    schedule.program.id = %program_id,
+                    "No tuner available until the program ended",
+                );
+                self.fail_to_start_recording(program_id, Error::TunerUnavailable)
+                    .await;
+                continue;
+            }
+            self.start_recording(program_id, addr.clone(), ctx).await;
+        }
+        true
     }
 
     async fn do_start_recording<C: Spawn>(
@@ -1769,9 +1833,11 @@ where
     O: Clone + Send + Sync + 'static,
     O: Call<onair::RegisterEmitter>,
 {
-    async fn handle(&mut self, msg: RecordingStopped, _ctx: &mut Context<Self>) {
+    async fn handle(&mut self, msg: RecordingStopped, ctx: &mut Context<Self>) {
         tracing::debug!(msg.name = "RecordingStopped", %msg.program_id);
-        let changed = self.handle_recording_stopped(msg.program_id).await;
+        let mut changed = self.handle_recording_stopped(msg.program_id).await;
+        // The tuner used by the stopped recorder has been released.
+        changed |= self.retry_parked(ctx.address().clone(), ctx).await;
         if changed {
             self.save_schedules();
         }
@@ -4060,6 +4126,198 @@ mod tests {
         assert_matches!(manager.schedules.get(&(0, 1, 1).into()), Some(schedule) => {
             assert_matches!(schedule.state, RecordingScheduleState::Failed);
         });
+    }
+
+    #[test(tokio::test)]
+    async fn test_start_recording_parked_until_recording_stopped() {
+        let now = Jst::now();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = config_for_test(temp_dir.path());
+
+        let running_id = ProgramId::from((0, 1, 1));
+        let parked_id = ProgramId::from((0, 1, 2));
+
+        let mut failed = MockRecordingFailedValidator::new();
+        failed.expect_emit().never();
+
+        // A recording holding the only tuner.
+        let mut manager = recording_manager!(config.clone());
+        let schedule = recording_schedule!(
+            RecordingScheduleState::Recording,
+            program!(running_id, now, "1h"),
+            service!((0, 1), "sv", channel_gr!("ch", "ch")),
+            recording_options!("1.m2ts", 0)
+        );
+        manager.schedules.insert(running_id, schedule);
+        manager
+            .recorders
+            .insert(running_id, recorder!(now, pipeline!["true"]));
+
+        let system = System::new();
+        {
+            let manager = system.spawn_actor(manager).await;
+
+            let result = manager
+                .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+                .await;
+            assert_matches!(result, Ok(_));
+
+            let result = manager
+                .call(StartRecording {
+                    schedule: recording_schedule!(
+                        RecordingScheduleState::Scheduled,
+                        program!(parked_id, now, "1h"),
+                        service!((0, 2), "sv", channel_gr!("ch", "unavailable-once")),
+                        recording_options!("2.m2ts", 0)
+                    ),
+                })
+                .await;
+            assert_matches!(result, Ok(Ok(())));
+
+            let result = manager
+                .call(QueryRecordingSchedule {
+                    program_id: parked_id,
+                })
+                .await;
+            assert_matches!(result, Ok(Ok(schedule)) => {
+                assert_matches!(schedule.state, RecordingScheduleState::Scheduled);
+            });
+
+            manager
+                .emit(RecordingStopped {
+                    program_id: running_id,
+                })
+                .await;
+
+            let result = manager
+                .call(QueryRecordingSchedule {
+                    program_id: parked_id,
+                })
+                .await;
+            assert_matches!(result, Ok(Ok(schedule)) => {
+                // The recording may finish soon because the stub stream ends.
+                assert_matches!(
+                    schedule.state,
+                    RecordingScheduleState::Recording | RecordingScheduleState::Finished
+                );
+            });
+        }
+        system.shutdown().await;
+    }
+
+    #[test(tokio::test)]
+    async fn test_start_recording_parked_until_program_ended() {
+        let now = Jst::now();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = config_for_test(temp_dir.path());
+
+        let running_id = ProgramId::from((0, 1, 1));
+        let parked_id = ProgramId::from((0, 1, 2));
+
+        let mut failed = MockRecordingFailedValidator::new();
+        failed
+            .expect_emit()
+            .withf(move |msg| msg.program_id == parked_id)
+            .returning(|_| ())
+            .once();
+
+        let mut manager = recording_manager!(config.clone());
+        let schedule = recording_schedule!(
+            RecordingScheduleState::Recording,
+            program!(running_id, now, "1h"),
+            service!((0, 1), "sv", channel_gr!("ch", "ch")),
+            recording_options!("1.m2ts", 0)
+        );
+        manager.schedules.insert(running_id, schedule);
+        manager
+            .recorders
+            .insert(running_id, recorder!(now, pipeline!["true"]));
+
+        let system = System::new();
+        {
+            let manager = system.spawn_actor(manager).await;
+
+            let result = manager
+                .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+                .await;
+            assert_matches!(result, Ok(_));
+
+            // The program ends in 500ms.
+            let start_at =
+                now - Duration::try_hours(1).unwrap() + Duration::try_milliseconds(500).unwrap();
+            let result = manager
+                .call(StartRecording {
+                    schedule: recording_schedule!(
+                        RecordingScheduleState::Scheduled,
+                        program!(parked_id, start_at, "1h"),
+                        service!((0, 2), "sv", channel_gr!("ch", "unavailable-once")),
+                        recording_options!("2.m2ts", 0)
+                    ),
+                })
+                .await;
+            assert_matches!(result, Ok(Ok(())));
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            manager
+                .emit(RecordingStopped {
+                    program_id: running_id,
+                })
+                .await;
+
+            let result = manager
+                .call(QueryRecordingSchedule {
+                    program_id: parked_id,
+                })
+                .await;
+            assert_matches!(result, Ok(Ok(schedule)) => {
+                assert_matches!(schedule.state, RecordingScheduleState::Failed);
+            });
+        }
+        system.shutdown().await;
+    }
+
+    #[test(tokio::test)]
+    async fn test_start_recording_tuner_unavailable_without_recorders() {
+        let now = Jst::now();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = config_for_test(temp_dir.path());
+
+        let program_id = ProgramId::from((0, 1, 1));
+
+        let mut failed = MockRecordingFailedValidator::new();
+        failed.expect_emit().returning(|_| ()).once();
+
+        let system = System::new();
+        {
+            let manager = system.spawn_actor(recording_manager!(config.clone())).await;
+
+            let result = manager
+                .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+                .await;
+            assert_matches!(result, Ok(_));
+
+            let result = manager
+                .call(StartRecording {
+                    schedule: recording_schedule!(
+                        RecordingScheduleState::Scheduled,
+                        program!(program_id, now, "1h"),
+                        service!((0, 1), "sv", channel_gr!("ch", "unavailable-once")),
+                        recording_options!("1.m2ts", 0)
+                    ),
+                })
+                .await;
+            assert_matches!(result, Ok(Ok(())));
+
+            let result = manager.call(QueryRecordingSchedule { program_id }).await;
+            assert_matches!(result, Ok(Ok(schedule)) => {
+                assert_matches!(schedule.state, RecordingScheduleState::Failed);
+            });
+        }
+        system.shutdown().await;
     }
 
     #[test(tokio::test)]
