@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use actlet::prelude::*;
 use bytes::Bytes;
+use bytes::BytesMut;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono_jst::Jst;
@@ -22,18 +23,19 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
+use tokio::sync::watch;
 use tokio_stream::Stream;
-use tokio_stream::StreamExt;
-use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
 use crate::command_util::CommandPipeline;
 use crate::command_util::CommandPipelineBuilder;
 use crate::command_util::CommandPipelineProcessModel;
-use crate::command_util::spawn_pipeline;
 use crate::config::Config;
 use crate::epg;
 use crate::epg::EpgProgram;
@@ -1180,6 +1182,10 @@ where
         };
         ctx.spawn_task(fut);
 
+        // `true` once everything has been flushed to the content file.  Streams opened during the
+        // recording follow the file through this channel, see `content_stream()`.
+        let (progress_tx, progress) = watch::channel(false);
+
         // Inner future in order to capture the result in an outer future.
         let inner_fut = {
             let content_path = content_path.clone();
@@ -1187,7 +1193,19 @@ where
                 let record = tokio::fs::File::create(&content_path).await?;
                 let mut writer = BufWriter::new(record);
                 // TODO: use Stdio
-                tokio::io::copy(&mut output, &mut writer).await
+                let mut buf = vec![0; 4096 * 8];
+                loop {
+                    let n = output.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    writer.write_all(&buf[..n]).await?;
+                    progress_tx.send_replace(false); // wake followers
+                }
+                writer.flush().await?;
+                progress_tx.send_replace(true);
+                // `progress_tx` is dropped on an error, which also ends the followers.
+                Ok::<_, std::io::Error>(())
             }
         };
         // Outer future emits messages to observers.
@@ -1210,6 +1228,8 @@ where
         };
 
         let recorder = Recorder {
+            record_id: record_id.clone(),
+            progress,
             started_at: now,
             pipeline,
             stop_trigger: Some(stop_trigger),
@@ -1426,20 +1446,11 @@ type StopTrigger = Trigger<actlet::Stop>;
 pub struct OpenContent {
     pub id: RecordId,
     pub range: Option<ContentRange>,
-    pub time_limit: u64,
 }
 
 impl OpenContent {
-    // See the `tail` command used in `ContentSource::new()` for the reason why the time limit is
-    // 1500ms.
-    const DEFAULT_TIME_LIMIT: u64 = 1500;
-
     pub fn new(id: RecordId, range: Option<ContentRange>) -> Self {
-        Self {
-            id,
-            range,
-            time_limit: Self::DEFAULT_TIME_LIMIT,
-        }
+        Self { id, range }
     }
 }
 
@@ -1460,11 +1471,10 @@ where
     async fn handle(
         &mut self,
         msg: OpenContent,
-        ctx: &mut Context<Self>,
+        _ctx: &mut Context<Self>,
     ) -> <OpenContent as Message>::Reply {
         tracing::debug!(msg.name = "OpenContent", %msg.id);
-        self.open_content(&msg.id, msg.range.as_ref(), msg.time_limit, ctx)
-            .await
+        self.open_content(&msg.id, msg.range.as_ref()).await
     }
 }
 
@@ -1473,8 +1483,6 @@ impl<T, E, O> RecordingManager<T, E, O> {
         &self,
         id: &RecordId,
         range: Option<&ContentRange>,
-        time_limit: u64,
-        ctx: &Context<Self>,
     ) -> Result<(ContentStream, Option<StopTrigger>), Error> {
         let record_path = match make_record_path(&self.config, id) {
             Some(record_path) => record_path,
@@ -1487,13 +1495,22 @@ impl<T, E, O> RecordingManager<T, E, O> {
             _ => return Err(Error::NoContent),
         };
 
-        let mut content_source = ContentSource::new(&self.config, &record, range, ctx).await?;
-        let stream = content_source.create_stream(time_limit);
+        // Follow only a recording this process is writing.  A range stops at the current end, as
+        // `dd` did.  The record ID check keeps a re-recording of the same program from being
+        // followed by mistake.
+        let progress = match range {
+            Some(_) => None,
+            None => self
+                .recorders
+                .get(&record.program.id)
+                .filter(|recorder| recorder.record_id == record.id)
+                .map(|recorder| recorder.progress.clone()),
+        };
 
-        let addr = ctx.spawn_actor(content_source).await;
-        let stop_trigger = Some(addr.trigger(actlet::Stop));
+        let stream = open_content_stream(&self.config, &record, range, progress).await?;
 
-        Ok((stream, stop_trigger))
+        // The stream ends by itself, so there is nothing to stop.
+        Ok((stream, None))
     }
 }
 
@@ -2240,24 +2257,9 @@ impl<T, E, O> RecordingManager<T, E, O> {
     }
 }
 
-// content source actor
+// content stream
 
-enum ContentSourceKind {
-    Pipeline(CommandPipeline<RecordId>),
-    // `None` once `create_stream()` has taken the reader.
-    File(Option<tokio::io::Take<tokio::fs::File>>),
-}
-
-impl std::fmt::Debug for ContentSourceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pipeline(_) => f.debug_tuple("Pipeline").finish(),
-            Self::File(reader) => f.debug_tuple("File").field(&reader.is_some()).finish(),
-        }
-    }
-}
-
-// The content can be removed between the existence check and opening or seeking it.
+// The content can be removed between loading the record and opening or seeking the content file.
 fn content_file_error(err: std::io::Error) -> Error {
     match err.kind() {
         std::io::ErrorKind::NotFound => Error::NoContent,
@@ -2265,122 +2267,78 @@ fn content_file_error(err: std::io::Error) -> Error {
     }
 }
 
-struct ContentSource {
-    id: RecordId,
-    kind: ContentSourceKind,
+// Every request is a seek followed by a limited read.  A request without a range is simply the
+// degenerate case of that: start at the beginning and take everything.
+async fn open_content_stream(
+    config: &Config,
+    record: &Record,
+    range: Option<&ContentRange>,
+    progress: Option<watch::Receiver<bool>>,
+) -> Result<ContentStream, Error> {
+    let content_path = make_content_path(config, record).unwrap();
+    let (first, count) = match range {
+        Some(range) => {
+            debug_assert!(range.is_partial());
+            (range.first(), range.bytes())
+        }
+        None => (0, u64::MAX),
+    };
+    let mut file = tokio::fs::File::open(&content_path).await.map_err(|e| {
+        tracing::warn!(?content_path, %e, "Failed to open content file");
+        content_file_error(e)
+    })?;
+    // Seeking past the end of the file is not an error, and reading from there yields no bytes.
+    // That matches what `dd ibs=1 skip=N` did.
+    //
+    // The HTTP layer normalizes ranges against the known content length before we get here, so a
+    // range past the end doesn't arrive through it.  We keep the `dd` behaviour anyway, for ranges
+    // built directly from `ContentRange::without_size` (which checks `first <= last` but holds no
+    // content length to check against) and for a file that shrinks after its length was read.
+    file.seek(std::io::SeekFrom::Start(first))
+        .await
+        .map_err(|e| {
+            tracing::warn!(?content_path, %e, "Failed to seek content file");
+            content_file_error(e)
+        })?;
+    let stream = content_stream(file.take(count), progress);
+    Ok(MpegTsStream::new(record.id.clone(), Box::pin(stream)))
 }
 
-impl ContentSource {
-    async fn new<C: Spawn>(
-        config: &Config,
-        record: &Record,
-        range: Option<&ContentRange>,
-        ctx: &C,
-    ) -> Result<Self, Error> {
-        let content_path = make_content_path(config, record).unwrap();
-        if !content_path.exists() {
-            tracing::warn!(?content_path, "No such file, maybe it has been removed");
-            return Err(Error::NoContent);
-        }
+// Streams `reader` until EOF.  With `progress`, EOF only pauses the stream until the recorder
+// writes more or reports that it has finished.
+//
+// There is no time limit.  A storage stall delays the stream instead of truncating it.
+fn content_stream<R>(
+    reader: R,
+    progress: Option<watch::Receiver<bool>>,
+) -> impl Stream<Item = std::io::Result<Bytes>>
+where
+    R: AsyncRead + Unpin,
+{
+    // 32 KiB, large enough for 10 ms buffering.
+    const CHUNK_SIZE: usize = 4096 * 8;
 
-        let id = record.id.clone();
-        let content_path_str = content_path.to_str().unwrap();
-        let kind = match (range, &record.recording_status) {
-            (None, RecordingStatus::Recording) => {
-                // We use `tail -f` for streaming during recording in order to send data to be
-                // appended to the content file in the future after the stream reaches EOF at that
-                // point.
-                //
-                // NOTE: `tail` in macOS doesn't support `-s` option.  The default value of the
-                // sleep interval of `tail` in GNU coreutils is 1.0 second.
-                let cmd = format!("tail -f -c +0 '{content_path_str}'");
-                ContentSourceKind::Pipeline(spawn_pipeline(vec![cmd], id.clone(), "content", ctx)?)
+    futures::stream::try_unfold(
+        (reader, progress, BytesMut::new()),
+        |(mut reader, mut progress, mut buf)| async move {
+            loop {
+                // Read the flag *before* reading the file so that a write in between wakes
+                // `changed()` below.
+                let done = progress.as_mut().is_none_or(|p| *p.borrow_and_update());
+                buf.reserve(CHUNK_SIZE);
+                if reader.read_buf(&mut buf).await? > 0 {
+                    return Ok(Some((buf.split().freeze(), (reader, progress, buf))));
+                }
+                if done {
+                    return Ok(None);
+                }
+                if progress.as_mut().unwrap().changed().await.is_err() {
+                    // The recorder has gone away on an error.  Send what is on disk and stop.
+                    progress = None;
+                }
             }
-            // Both a range request and a whole-content request are a seek followed by a limited
-            // read.  A request without a range is simply the degenerate case of that: start at the
-            // beginning and take everything.
-            _ => {
-                let (first, count) = match range {
-                    Some(range) => {
-                        debug_assert!(range.is_partial());
-                        (range.first(), range.bytes())
-                    }
-                    None => (0, u64::MAX),
-                };
-                let mut file = tokio::fs::File::open(&content_path).await.map_err(|e| {
-                    tracing::warn!(?content_path, %e, "Failed to open content file");
-                    content_file_error(e)
-                })?;
-                // Seeking past the end of the file is not an error, and reading from there yields
-                // no bytes.  That matches what `dd ibs=1 skip=N` did.
-                //
-                // The HTTP layer normalizes ranges against the known content length before we get
-                // here, so a range past the end doesn't arrive through it.  We keep the `dd`
-                // behaviour anyway, for ranges built directly from `ContentRange::without_size`
-                // (which checks `first <= last` but holds no content length to check against) and
-                // for a file that shrinks after its length was read.
-                tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(first))
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(?content_path, %e, "Failed to seek content file");
-                        content_file_error(e)
-                    })?;
-                ContentSourceKind::File(Some(tokio::io::AsyncReadExt::take(file, count)))
-            }
-        };
-
-        Ok(Self { id, kind })
-    }
-
-    fn create_stream(&mut self, time_limit: u64) -> ContentStream {
-        // 32 KiB, large enough for 10 ms buffering.
-        const CHUNK_SIZE: usize = 4096 * 8;
-
-        match &mut self.kind {
-            ContentSourceKind::Pipeline(pipeline) => {
-                let (_, output) = pipeline.take_endpoints();
-                let stream = ReaderStream::with_capacity(output, CHUNK_SIZE)
-                    // We set a time limit in order to stop streaming when the stream reaches the
-                    // *true* EOF.  Because `tail -f` doesn't terminate when the stream reaches an
-                    // EOF at that point.
-                    //
-                    // We cannot use a RecordingStopped emitter for this purpose.  Because the
-                    // streaming has to continue in order to send remaining data until the *true*
-                    // EOF reaches.
-                    .timeout(std::time::Duration::from_millis(time_limit))
-                    .map_while(Result::ok);
-                MpegTsStream::new(self.id.clone(), Box::pin(stream))
-            }
-            ContentSourceKind::File(reader) => {
-                let reader = reader.take().expect("create_stream called twice");
-                // No time limit here, unlike the pipeline above.  The time limit exists solely
-                // because `tail -f` never terminates on its own; reading a regular file ends at
-                // EOF.  The previous implementation streamed every case through a pipeline and so
-                // applied the limit to `cat` and `dd` as well, which meant a storage stall longer
-                // than the limit silently truncated the response instead of delaying it.
-                let stream = ReaderStream::with_capacity(reader, CHUNK_SIZE);
-                MpegTsStream::new(self.id.clone(), Box::pin(stream))
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl Actor for ContentSource {
-    async fn started(&mut self, _ctx: &mut Context<Self>) {
-        tracing::debug!(content_source.id = %self.id, "Started");
-    }
-
-    async fn stopping(&mut self, _ctx: &mut Context<Self>) {
-        tracing::debug!(content_source.id = %self.id, "Stopping...");
-        if let ContentSourceKind::Pipeline(pipeline) = &mut self.kind {
-            pipeline.kill();
-        }
-    }
-
-    async fn stopped(&mut self, _ctx: &mut Context<Self>) {
-        tracing::debug!(content_source.id = %self.id, "Stopped");
-    }
+        },
+    )
 }
 
 // models
@@ -2536,6 +2494,8 @@ pub struct RecordingOptions {
 }
 
 struct Recorder {
+    record_id: RecordId,
+    progress: watch::Receiver<bool>,
     started_at: DateTime<Jst>,
     pipeline: CommandPipeline<TunerSubscriptionId>,
     stop_trigger: Option<Trigger<StopStreaming>>,
@@ -3736,40 +3696,39 @@ mod tests {
             .await
             .unwrap();
 
-        let system = System::new();
-        {
-            let manager = system.spawn_actor(recording_manager!(config.clone())).await;
+        let mut manager = recording_manager!(config.clone());
+        let (progress_tx, progress) = watch::channel(false);
+        let recorder = recorder!(Jst::now(), pipeline!["true"], id.clone(), progress);
+        manager.recorders.insert(record.program.id, recorder);
 
-            let result = manager.call(OpenContent::new(id.clone(), None)).await;
-            let (stream, stop_trigger) = match result {
-                Ok(Ok(tuple)) => tuple,
-                _ => panic!(),
-            };
+        let (stream, stop_trigger) = manager.open_content(&id, None).await.unwrap();
+        assert!(stop_trigger.is_none());
+        let mut reader = tokio_util::io::StreamReader::new(stream);
 
-            let mut reader = tokio_util::io::StreamReader::new(stream);
+        let mut buf = [0; 10];
+        reader.read_exact(&mut buf).await.unwrap(); // EOF reaches.
+        assert_eq!(&buf, b"0123456789");
 
-            let mut buf = [0; 10];
-            reader.read_exact(&mut buf).await.unwrap(); // EOF reaches.
-            assert_eq!(&buf, b"0123456789");
+        append(&content_path, b"abc").await;
+        progress_tx.send_replace(false);
 
-            append(&content_path, b"abc").await;
+        let mut buf = [0; 3];
+        reader.read_exact(&mut buf).await.unwrap(); // EOF reaches again.
+        assert_eq!(&buf, b"abc");
 
-            let mut buf = [0; 3];
-            reader.read_exact(&mut buf).await.unwrap(); // EOF reaches again.
-            assert_eq!(&buf, b"abc");
+        append(&content_path, b"def").await;
+        progress_tx.send_replace(true);
 
-            // The streaming will stop within 100ms without explicit `drop(stop_trigger)`.
-            assert_matches!(reader.read_exact(&mut buf).await, Err(err) => {
-                assert_matches!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-            });
-
-            drop(stop_trigger);
-        }
-        system.shutdown().await;
+        // The remaining data is sent and then the stream ends.
+        let mut content = String::new();
+        assert_matches!(reader.read_to_string(&mut content).await, Ok(3));
+        assert_eq!(content, "def");
     }
 
+    // Only a recording written by a recorder in this process is followed.  Otherwise, the stream
+    // ends at the current EOF even if the record says it's being recorded.
     #[test(tokio::test)]
-    async fn test_open_content_stop_trigger() {
+    async fn test_open_content_during_recording_without_recorder() {
         let temp_dir = TempDir::new().unwrap();
         let config = config_for_test(temp_dir.path());
 
@@ -3783,30 +3742,55 @@ mod tests {
             .await
             .unwrap();
 
-        let system = System::new();
-        {
-            let manager = system.spawn_actor(recording_manager!(config.clone())).await;
+        let mut manager = recording_manager!(config.clone());
 
-            let result = manager.call(OpenContent::new(id.clone(), None)).await;
-            let (stream, stop_trigger) = match result {
-                Ok(Ok(tuple)) => tuple,
-                _ => panic!(),
-            };
+        // No recorder.
+        let (stream, _) = manager.open_content(&id, None).await.unwrap();
+        let mut reader = tokio_util::io::StreamReader::new(stream);
+        let mut content = String::new();
+        assert_matches!(reader.read_to_string(&mut content).await, Ok(10));
 
-            let mut reader = tokio_util::io::StreamReader::new(stream);
+        // A recorder for another record of the same program.
+        let (_progress_tx, progress) = watch::channel(false);
+        let recorder = recorder!(
+            Jst::now(),
+            pipeline!["true"],
+            RecordId("2".to_string()),
+            progress
+        );
+        manager.recorders.insert(record.program.id, recorder);
+        let (stream, _) = manager.open_content(&id, None).await.unwrap();
+        let mut reader = tokio_util::io::StreamReader::new(stream);
+        let mut content = String::new();
+        assert_matches!(reader.read_to_string(&mut content).await, Ok(10));
+    }
 
-            let mut buf = [0; 10];
-            reader.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf, b"0123456789");
+    #[test(tokio::test)]
+    async fn test_content_stream_recorder_gone() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("1.m2ts");
+        tokio::fs::write(&path, b"abc").await.unwrap();
 
-            drop(stop_trigger);
+        let (progress_tx, progress) = watch::channel(false);
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut reader =
+            tokio_util::io::StreamReader::new(Box::pin(content_stream(file, Some(progress))));
 
-            // The streaming will stop soon before the timeout.
-            assert_matches!(reader.read_exact(&mut buf).await, Err(err) => {
-                assert_matches!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-            });
-        }
-        system.shutdown().await;
+        let mut buf = [0; 3];
+        reader.read_exact(&mut buf).await.unwrap(); // EOF reaches.
+        assert_eq!(&buf, b"abc");
+
+        // The recorder fails without reporting the end, after writing some more data.
+        let wait = tokio::spawn(async move {
+            let mut content = String::new();
+            reader.read_to_string(&mut content).await.map(|_| content)
+        });
+        tokio::task::yield_now().await;
+        append(&path, b"def").await;
+        drop(progress_tx);
+
+        // The data on disk is still sent, and then the stream ends.
+        assert_eq!(wait.await.unwrap().unwrap(), "def");
     }
 
     #[test(tokio::test)]
@@ -4225,34 +4209,22 @@ mod tests {
     }
 
     #[test(tokio::test)]
-    async fn test_content_source_create_stream() {
+    async fn test_open_content_stream() {
         let temp_dir = TempDir::new().unwrap();
         let config = config_for_test(temp_dir.path());
-
-        let ctx = actlet::stubs::Context::default();
 
         let id = RecordId("1".to_string());
         let record = record!(recording: id.value());
 
         let content_path = make_content_path(&config, &record).unwrap();
-        let content_path_str = content_path.to_str().unwrap();
         tokio::fs::write(&content_path, b"0123456789")
             .await
             .unwrap();
 
-        // recording, w/o range
-        let mut source = ContentSource::new(&config, &record, None, &ctx)
+        // recording, w/o range, w/o recorder
+        let stream = open_content_stream(&config, &record, None, None)
             .await
             .unwrap();
-        assert_matches!(&source.kind, ContentSourceKind::Pipeline(pipeline) => {
-            let models = pipeline.get_model();
-            assert_eq!(models.len(), 1);
-            assert_matches!(models[0], CommandPipelineProcessModel { ref command, pid } => {
-                assert_eq!(*command, format!("tail -f -c +0 '{content_path_str}'"));
-                assert!(pid.is_some());
-            });
-        });
-        let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut content = String::new();
         assert_matches!(reader.read_to_string(&mut content).await, Ok(size) => {
@@ -4262,11 +4234,9 @@ mod tests {
 
         // recording, w/ range: uses seek + take instead of `dd`
         let range = Some(ContentRange::without_size(1, 3).unwrap());
-        let mut source = ContentSource::new(&config, &record, range.as_ref(), &ctx)
+        let stream = open_content_stream(&config, &record, range.as_ref(), None)
             .await
             .unwrap();
-        assert_matches!(&source.kind, ContentSourceKind::File(Some(_)));
-        let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut content = String::new();
         assert_matches!(reader.read_to_string(&mut content).await, Ok(size) => {
@@ -4277,11 +4247,9 @@ mod tests {
         let record = record!(finished: id.value());
 
         // finished, w/o range
-        let mut source = ContentSource::new(&config, &record, None, &ctx)
+        let stream = open_content_stream(&config, &record, None, None)
             .await
             .unwrap();
-        assert_matches!(&source.kind, ContentSourceKind::File(Some(_)));
-        let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut content = String::new();
         assert_matches!(reader.read_to_string(&mut content).await, Ok(size) => {
@@ -4291,11 +4259,9 @@ mod tests {
 
         // finished, w/ range: uses seek + take instead of `dd`
         let range = Some(ContentRange::with_size(1, 3, 10).unwrap());
-        let mut source = ContentSource::new(&config, &record, range.as_ref(), &ctx)
+        let stream = open_content_stream(&config, &record, range.as_ref(), None)
             .await
             .unwrap();
-        assert_matches!(&source.kind, ContentSourceKind::File(Some(_)));
-        let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut content = String::new();
         assert_matches!(reader.read_to_string(&mut content).await, Ok(size) => {
@@ -4304,14 +4270,12 @@ mod tests {
         });
     }
 
-    // The content used in `test_content_source_create_stream` is 10 bytes, far smaller than
+    // The content used in `test_open_content_stream` is 10 bytes, far smaller than
     // CHUNK_SIZE, so it never exercises a stream that spans multiple chunks.
     #[test(tokio::test)]
-    async fn test_content_source_create_stream_spanning_chunks() {
+    async fn test_open_content_stream_spanning_chunks() {
         let temp_dir = TempDir::new().unwrap();
         let config = config_for_test(temp_dir.path());
-
-        let ctx = actlet::stubs::Context::default();
 
         let id = RecordId("1".to_string());
         let record = record!(finished: id.value());
@@ -4324,10 +4288,9 @@ mod tests {
         tokio::fs::write(&content_path, &content).await.unwrap();
 
         // The whole content, w/o range.
-        let mut source = ContentSource::new(&config, &record, None, &ctx)
+        let stream = open_content_stream(&config, &record, None, None)
             .await
             .unwrap();
-        let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut got = Vec::new();
         assert_matches!(reader.read_to_end(&mut got).await, Ok(size) => {
@@ -4339,10 +4302,9 @@ mod tests {
         let first = 4096 * 8 + 777;
         let last = LEN - 999;
         let range = Some(ContentRange::with_size(first as u64, last as u64, LEN as u64).unwrap());
-        let mut source = ContentSource::new(&config, &record, range.as_ref(), &ctx)
+        let stream = open_content_stream(&config, &record, range.as_ref(), None)
             .await
             .unwrap();
-        let stream = source.create_stream(1000);
         let mut reader = tokio_util::io::StreamReader::new(stream);
         let mut got = Vec::new();
         assert_matches!(reader.read_to_end(&mut got).await, Ok(size) => {
@@ -4352,16 +4314,14 @@ mod tests {
     }
 
     // HTTP ranges are normalized against the known content length before reaching
-    // `ContentSource`.  This covers ranges built directly with `ContentRange::without_size`, which
+    // `open_content_stream()`.  This covers ranges built directly with `ContentRange::without_size`, which
     // checks `first <= last` but has no content length to check against, and the case where a file
     // shrinks after its length is read.  Both have to keep the old `dd` behavior: return whatever
     // is available and stop, rather than fail.
     #[test(tokio::test)]
-    async fn test_content_source_create_stream_range_past_eof() {
+    async fn test_open_content_stream_range_past_eof() {
         let temp_dir = TempDir::new().unwrap();
         let config = config_for_test(temp_dir.path());
-
-        let ctx = actlet::stubs::Context::default();
 
         let id = RecordId("1".to_string());
         let record = record!(recording: id.value());
@@ -4385,10 +4345,9 @@ mod tests {
 
         for &(first, last, expected) in cases {
             let range = Some(ContentRange::without_size(first, last).unwrap());
-            let mut source = ContentSource::new(&config, &record, range.as_ref(), &ctx)
+            let stream = open_content_stream(&config, &record, range.as_ref(), None)
                 .await
                 .unwrap();
-            let stream = source.create_stream(1000);
             let mut reader = tokio_util::io::StreamReader::new(stream);
             let mut content = String::new();
             assert_matches!(reader.read_to_string(&mut content).await, Ok(size) => {
