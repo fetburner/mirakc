@@ -1197,7 +1197,7 @@ where
                 // TODO: use Stdio
                 tokio::io::copy(&mut reader, &mut writer).await?;
                 drop(reader);
-                let _ = content_sha256.set(format_sha256(hasher));
+                let _ = content_sha256.set(format_sha256(hasher.finalize()));
                 Ok::<_, std::io::Error>(())
             }
         };
@@ -2809,12 +2809,8 @@ fn glob_records(records_dir: &Path) -> impl Iterator<Item = PathBuf> {
         })
 }
 
-fn format_sha256(hasher: Sha256) -> String {
-    hasher
-        .finalize()
-        .into_iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
+fn format_sha256(hash: impl IntoIterator<Item = u8>) -> String {
+    hash.into_iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -3484,9 +3480,7 @@ mod tests {
                     assert_matches!(record.recording_status, RecordingStatus::Finished);
                     let content_path = make_content_path(&config, &record).unwrap();
                     let content = std::fs::read(content_path).unwrap();
-                    let mut hasher = Sha256::new();
-                    hasher.update(&content);
-                    assert_eq!(record.content_sha256, Some(format_sha256(hasher)));
+                    assert_eq!(record.content_sha256, Some(format_sha256(Sha256::digest(content))));
                 });
             });
         }
