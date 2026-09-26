@@ -23,13 +23,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
-use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
-use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
 use tokio::sync::watch;
 use tokio_stream::Stream;
+use tokio_util::io::InspectWriter;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
@@ -1191,21 +1189,17 @@ where
             let content_path = content_path.clone();
             async move {
                 let record = tokio::fs::File::create(&content_path).await?;
+                // Wake the followers each time data is written to the file.
+                let record = InspectWriter::new(record, |_| {
+                    progress_tx.send_replace(false);
+                });
                 let mut writer = BufWriter::new(record);
                 // TODO: use Stdio
-                let mut buf = vec![0; 4096 * 8];
-                loop {
-                    let n = output.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    writer.write_all(&buf[..n]).await?;
-                    progress_tx.send_replace(false); // wake followers
-                }
-                writer.flush().await?;
+                let n = tokio::io::copy(&mut output, &mut writer).await?;
+                // `copy()` flushes the writer before returning.  `progress_tx` is dropped without
+                // this on an error, which also ends the followers.
                 progress_tx.send_replace(true);
-                // `progress_tx` is dropped on an error, which also ends the followers.
-                Ok::<_, std::io::Error>(())
+                Ok::<_, std::io::Error>(n)
             }
         };
         // Outer future emits messages to observers.
@@ -1228,7 +1222,6 @@ where
         };
 
         let recorder = Recorder {
-            record_id: record_id.clone(),
             progress,
             started_at: now,
             pipeline,
@@ -1503,7 +1496,9 @@ impl<T, E, O> RecordingManager<T, E, O> {
             None => self
                 .recorders
                 .get(&record.program.id)
-                .filter(|recorder| recorder.record_id == record.id)
+                .filter(|recorder| {
+                    RecordId::from((recorder.started_at, record.program.id)) == record.id
+                })
                 .map(|recorder| recorder.progress.clone()),
         };
 
@@ -2294,13 +2289,13 @@ async fn open_content_stream(
     // range past the end doesn't arrive through it.  We keep the `dd` behaviour anyway, for ranges
     // built directly from `ContentRange::without_size` (which checks `first <= last` but holds no
     // content length to check against) and for a file that shrinks after its length was read.
-    file.seek(std::io::SeekFrom::Start(first))
+    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(first))
         .await
         .map_err(|e| {
             tracing::warn!(?content_path, %e, "Failed to seek content file");
             content_file_error(e)
         })?;
-    let stream = content_stream(file.take(count), progress);
+    let stream = content_stream(tokio::io::AsyncReadExt::take(file, count), progress);
     Ok(MpegTsStream::new(record.id.clone(), Box::pin(stream)))
 }
 
@@ -2313,7 +2308,7 @@ fn content_stream<R>(
     progress: Option<watch::Receiver<bool>>,
 ) -> impl Stream<Item = std::io::Result<Bytes>>
 where
-    R: AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
     // 32 KiB, large enough for 10 ms buffering.
     const CHUNK_SIZE: usize = 4096 * 8;
@@ -2494,7 +2489,6 @@ pub struct RecordingOptions {
 }
 
 struct Recorder {
-    record_id: RecordId,
     progress: watch::Receiver<bool>,
     started_at: DateTime<Jst>,
     pipeline: CommandPipeline<TunerSubscriptionId>,
@@ -3686,8 +3680,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = config_for_test(temp_dir.path());
 
-        let id = RecordId("1".to_string());
-        let record = record!(recording: id.clone());
+        let started_at = Jst::now();
+        let id = RecordId::from((started_at, ProgramId::from((0, 1, 2))));
+        let record = record!(recording: id.value());
         let record_path = make_record_path(&config, &id).unwrap();
         assert!(file_util::save_json(&record, &record_path));
 
@@ -3698,7 +3693,8 @@ mod tests {
 
         let mut manager = recording_manager!(config.clone());
         let (progress_tx, progress) = watch::channel(false);
-        let recorder = recorder!(Jst::now(), pipeline!["true"], id.clone(), progress);
+        let mut recorder = recorder!(started_at, pipeline!["true"]);
+        recorder.progress = progress;
         manager.recorders.insert(record.program.id, recorder);
 
         let (stream, stop_trigger) = manager.open_content(&id, None).await.unwrap();
@@ -3752,12 +3748,8 @@ mod tests {
 
         // A recorder for another record of the same program.
         let (_progress_tx, progress) = watch::channel(false);
-        let recorder = recorder!(
-            Jst::now(),
-            pipeline!["true"],
-            RecordId("2".to_string()),
-            progress
-        );
+        let mut recorder = recorder!(Jst::now(), pipeline!["true"]);
+        recorder.progress = progress;
         manager.recorders.insert(record.program.id, recorder);
         let (stream, _) = manager.open_content(&id, None).await.unwrap();
         let mut reader = tokio_util::io::StreamReader::new(stream);
