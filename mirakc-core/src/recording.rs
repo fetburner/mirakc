@@ -1491,16 +1491,14 @@ impl<T, E, O> RecordingManager<T, E, O> {
         // Follow only a recording this process is writing.  A range stops at the current end, as
         // `dd` did.  The record ID check keeps a re-recording of the same program from being
         // followed by mistake.
-        let progress = match range {
-            Some(_) => None,
-            None => self
-                .recorders
-                .get(&record.program.id)
-                .filter(|recorder| {
-                    RecordId::from((recorder.started_at, record.program.id)) == record.id
-                })
-                .map(|recorder| recorder.progress.clone()),
-        };
+        let progress = self
+            .recorders
+            .get(&record.program.id)
+            .filter(|recorder| {
+                range.is_none()
+                    && RecordId::from((recorder.started_at, record.program.id)) == record.id
+            })
+            .map(|recorder| recorder.progress.clone());
 
         let stream = open_content_stream(&self.config, &record, range, progress).await?;
 
