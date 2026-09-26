@@ -27,7 +27,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::BufWriter;
 use tokio::sync::watch;
 use tokio_stream::Stream;
-use tokio_util::io::InspectWriter;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
@@ -1189,10 +1188,10 @@ where
             let content_path = content_path.clone();
             async move {
                 let record = tokio::fs::File::create(&content_path).await?;
-                // Wake the followers each time data is written to the file.
-                let record = InspectWriter::new(record, |_| {
-                    progress_tx.send_replace(false);
-                });
+                let record = ProgressWriter {
+                    writer: record,
+                    progress: &progress_tx,
+                };
                 let mut writer = BufWriter::new(record);
                 // TODO: use Stdio
                 let n = tokio::io::copy(&mut output, &mut writer).await?;
@@ -2251,6 +2250,48 @@ impl<T, E, O> RecordingManager<T, E, O> {
 }
 
 // content stream
+
+// Wakes the followers each time data may have reached the file.
+//
+// `tokio::fs::File::poll_write()` returns before the data is written to the file, so notifying only
+// on writes, as `tokio_util::io::InspectWriter` would, delays the latest data until the next write.
+// `poll_flush()` returns after the data is written, and `tokio::io::copy()` flushes whenever the
+// input has nothing to read.
+struct ProgressWriter<'a, W> {
+    writer: W,
+    progress: &'a watch::Sender<bool>,
+}
+
+impl<W> tokio::io::AsyncWrite for ProgressWriter<'_, W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::task::ready!(Pin::new(&mut self.writer).poll_write(cx, buf));
+        self.progress.send_replace(false);
+        std::task::Poll::Ready(result)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::task::ready!(Pin::new(&mut self.writer).poll_flush(cx));
+        self.progress.send_replace(false);
+        std::task::Poll::Ready(result)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
 
 // The content can be removed between loading the record and opening or seeking the content file.
 fn content_file_error(err: std::io::Error) -> Error {
@@ -3756,6 +3797,28 @@ mod tests {
     }
 
     #[test(tokio::test)]
+    async fn test_progress_writer() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("1.m2ts");
+        let (progress_tx, mut progress) = watch::channel(false);
+        let mut writer = ProgressWriter {
+            writer: tokio::fs::File::create(&path).await.unwrap(),
+            progress: &progress_tx,
+        };
+
+        writer.write_all(b"abc").await.unwrap();
+        assert!(progress.has_changed().unwrap());
+        progress.mark_unchanged();
+
+        // The data is in the file when the followers are woken by a flush.
+        writer.flush().await.unwrap();
+        assert!(progress.has_changed().unwrap());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abc");
+    }
+
+    #[test(tokio::test)]
     async fn test_content_stream_recorder_gone() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("1.m2ts");
@@ -4401,14 +4464,14 @@ mod tests {
 
     async fn append(path: &Path, data: &[u8]) {
         use tokio::io::AsyncWriteExt;
-        tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .append(true)
             .open(path)
             .await
-            .unwrap()
-            .write_all(data)
-            .await
             .unwrap();
+        file.write_all(data).await.unwrap();
+        // `write_all()` may return before the data is written to the file.
+        file.flush().await.unwrap();
     }
 
     mockall::mock! {
