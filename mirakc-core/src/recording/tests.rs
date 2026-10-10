@@ -1431,11 +1431,7 @@ async fn test_start_recording_parked_until_recording_stopped() {
             })
             .await;
         assert_matches!(result, Ok(Ok(schedule)) => {
-            // The recording may finish soon because the stub stream ends.
-            assert_matches!(
-                schedule.state,
-                RecordingScheduleState::Recording | RecordingScheduleState::Finished
-            );
+            assert_matches!(schedule.state, RecordingScheduleState::Recording);
         });
     }
     system.shutdown().await;
@@ -1479,9 +1475,8 @@ async fn test_start_recording_parked_until_program_ended() {
             .await;
         assert_matches!(result, Ok(_));
 
-        // The program ends in 500ms.
-        let start_at =
-            now - Duration::try_hours(1).unwrap() + Duration::try_milliseconds(500).unwrap();
+        // The program ends in 2s.
+        let start_at = now - Duration::try_hours(1).unwrap() + Duration::try_seconds(2).unwrap();
         let result = manager
             .call(StartRecording {
                 schedule: recording_schedule!(
@@ -1494,7 +1489,16 @@ async fn test_start_recording_parked_until_program_ended() {
             .await;
         assert_matches!(result, Ok(Ok(())));
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let result = manager
+            .call(QueryRecordingSchedule {
+                program_id: parked_id,
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(schedule)) => {
+            assert_matches!(schedule.state, RecordingScheduleState::Scheduled);
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         manager
             .emit(RecordingStopped {
@@ -1510,6 +1514,81 @@ async fn test_start_recording_parked_until_program_ended() {
         assert_matches!(result, Ok(Ok(schedule)) => {
             assert_matches!(schedule.state, RecordingScheduleState::Failed);
         });
+    }
+    system.shutdown().await;
+}
+
+#[test(tokio::test)]
+async fn test_start_recording_parked_requeued_if_not_started_yet() {
+    let now = Jst::now();
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = config_for_test(temp_dir.path());
+
+    let running_id = ProgramId::from((0, 1, 1));
+    let parked_id = ProgramId::from((0, 1, 2));
+
+    let mut failed = MockRecordingFailedValidator::new();
+    failed.expect_emit().never();
+
+    let mut manager = recording_manager!(config.clone());
+    let schedule = recording_schedule!(
+        RecordingScheduleState::Recording,
+        program!(running_id, now, "1h"),
+        service!((0, 1), "sv", channel_gr!("ch", "ch")),
+        recording_options!("1.m2ts", 0)
+    );
+    manager.schedules.insert(running_id, schedule);
+    manager
+        .recorders
+        .insert(running_id, recorder!(now, pipeline!["true"]));
+
+    let system = System::new();
+    {
+        let manager = system.spawn_actor(manager).await;
+
+        let result = manager
+            .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+            .await;
+        assert_matches!(result, Ok(_));
+
+        // Parked even though the program starts in 1h, e.g. postponed while
+        // parked.
+        let result = manager
+            .call(StartRecording {
+                schedule: recording_schedule!(
+                    RecordingScheduleState::Scheduled,
+                    program!(parked_id, now + Duration::try_hours(1).unwrap(), "1h"),
+                    service!((0, 2), "sv", channel_gr!("ch", "unavailable-once")),
+                    recording_options!("2.m2ts", 0)
+                ),
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(())));
+
+        manager
+            .emit(RecordingStopped {
+                program_id: running_id,
+            })
+            .await;
+
+        let result = manager
+            .inspect(move |manager| {
+                assert!(manager.parked.is_empty());
+                assert!(manager.recorders.is_empty());
+                assert!(
+                    manager
+                        .queue
+                        .iter()
+                        .any(|item| item.program_id == parked_id)
+                );
+                assert_matches!(
+                    manager.schedules[&parked_id].state,
+                    RecordingScheduleState::Scheduled
+                );
+            })
+            .await;
+        assert_matches!(result, Ok(()));
     }
     system.shutdown().await;
 }

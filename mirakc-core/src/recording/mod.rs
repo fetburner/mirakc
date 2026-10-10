@@ -1279,12 +1279,19 @@ where
     }
 
     async fn retry_parked<C: Spawn>(&mut self, addr: Address<Self>, ctx: &C) -> bool {
+        let now = Jst::now();
+        let prep_secs = Duration::try_seconds(PREP_SECS).unwrap();
         let mut program_ids = std::mem::take(&mut self.parked);
-        // Schedules may have been removed or changed while parked.
+        // Schedules may have been removed or changed while parked.  Schedules
+        // whose start time has been postponed go back to the queue.
         program_ids.retain(|program_id| {
-            self.schedules
-                .get(program_id)
-                .is_some_and(|schedule| schedule.is_ready_for_recording())
+            self.schedules.get(program_id).is_some_and(|schedule| {
+                schedule.is_ready_for_recording()
+                    && schedule
+                        .program
+                        .start_at
+                        .is_some_and(|start_at| start_at - now <= prep_secs)
+            })
         });
         if program_ids.is_empty() {
             return false;
@@ -1296,7 +1303,6 @@ where
                 schedule.program.start_at,
             )
         });
-        let now = Jst::now();
         for program_id in program_ids.into_iter() {
             let end_at = self.schedules[&program_id].program.end_at();
             if end_at.is_none_or(|end_at| end_at <= now) {
@@ -2034,6 +2040,8 @@ where
         let mut changed = self.handle_recording_stopped(msg.program_id).await;
         // The tuner used by the stopped recorder has been released.
         changed |= self.retry_parked(ctx.address().clone(), ctx).await;
+        self.rebuild_queue();
+        self.set_timer(ctx);
         if changed {
             self.save_schedules();
         }
