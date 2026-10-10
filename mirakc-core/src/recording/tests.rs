@@ -1364,6 +1364,198 @@ async fn test_handle_recording_stopped_pipeline_error() {
 }
 
 #[test(tokio::test)]
+async fn test_start_recording_parked_until_recording_stopped() {
+    let now = Jst::now();
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = config_for_test(temp_dir.path());
+
+    let running_id = ProgramId::from((0, 1, 1));
+    let parked_id = ProgramId::from((0, 1, 2));
+
+    let mut failed = MockRecordingFailedValidator::new();
+    failed.expect_emit().never();
+
+    // A recording holding the only tuner.
+    let mut manager = recording_manager!(config.clone());
+    let schedule = recording_schedule!(
+        RecordingScheduleState::Recording,
+        program!(running_id, now, "1h"),
+        service!((0, 1), "sv", channel_gr!("ch", "ch")),
+        recording_options!("1.m2ts", 0)
+    );
+    manager.schedules.insert(running_id, schedule);
+    manager
+        .recorders
+        .insert(running_id, recorder!(now, pipeline!["true"]));
+
+    let system = System::new();
+    {
+        let manager = system.spawn_actor(manager).await;
+
+        let result = manager
+            .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+            .await;
+        assert_matches!(result, Ok(_));
+
+        let result = manager
+            .call(StartRecording {
+                schedule: recording_schedule!(
+                    RecordingScheduleState::Scheduled,
+                    program!(parked_id, now, "1h"),
+                    service!((0, 2), "sv", channel_gr!("ch", "unavailable-once")),
+                    recording_options!("2.m2ts", 0)
+                ),
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(())));
+
+        let result = manager
+            .call(QueryRecordingSchedule {
+                program_id: parked_id,
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(schedule)) => {
+            assert_matches!(schedule.state, RecordingScheduleState::Scheduled);
+        });
+
+        manager
+            .emit(RecordingStopped {
+                program_id: running_id,
+            })
+            .await;
+
+        let result = manager
+            .call(QueryRecordingSchedule {
+                program_id: parked_id,
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(schedule)) => {
+            // The recording may finish soon because the stub stream ends.
+            assert_matches!(
+                schedule.state,
+                RecordingScheduleState::Recording | RecordingScheduleState::Finished
+            );
+        });
+    }
+    system.shutdown().await;
+}
+
+#[test(tokio::test)]
+async fn test_start_recording_parked_until_program_ended() {
+    let now = Jst::now();
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = config_for_test(temp_dir.path());
+
+    let running_id = ProgramId::from((0, 1, 1));
+    let parked_id = ProgramId::from((0, 1, 2));
+
+    let mut failed = MockRecordingFailedValidator::new();
+    failed
+        .expect_emit()
+        .withf(move |msg| msg.program_id == parked_id)
+        .returning(|_| ())
+        .once();
+
+    let mut manager = recording_manager!(config.clone());
+    let schedule = recording_schedule!(
+        RecordingScheduleState::Recording,
+        program!(running_id, now, "1h"),
+        service!((0, 1), "sv", channel_gr!("ch", "ch")),
+        recording_options!("1.m2ts", 0)
+    );
+    manager.schedules.insert(running_id, schedule);
+    manager
+        .recorders
+        .insert(running_id, recorder!(now, pipeline!["true"]));
+
+    let system = System::new();
+    {
+        let manager = system.spawn_actor(manager).await;
+
+        let result = manager
+            .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+            .await;
+        assert_matches!(result, Ok(_));
+
+        // The program ends in 500ms.
+        let start_at =
+            now - Duration::try_hours(1).unwrap() + Duration::try_milliseconds(500).unwrap();
+        let result = manager
+            .call(StartRecording {
+                schedule: recording_schedule!(
+                    RecordingScheduleState::Scheduled,
+                    program!(parked_id, start_at, "1h"),
+                    service!((0, 2), "sv", channel_gr!("ch", "unavailable-once")),
+                    recording_options!("2.m2ts", 0)
+                ),
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(())));
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        manager
+            .emit(RecordingStopped {
+                program_id: running_id,
+            })
+            .await;
+
+        let result = manager
+            .call(QueryRecordingSchedule {
+                program_id: parked_id,
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(schedule)) => {
+            assert_matches!(schedule.state, RecordingScheduleState::Failed);
+        });
+    }
+    system.shutdown().await;
+}
+
+#[test(tokio::test)]
+async fn test_start_recording_tuner_unavailable_without_recorders() {
+    let now = Jst::now();
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = config_for_test(temp_dir.path());
+
+    let program_id = ProgramId::from((0, 1, 1));
+
+    let mut failed = MockRecordingFailedValidator::new();
+    failed.expect_emit().returning(|_| ()).once();
+
+    let system = System::new();
+    {
+        let manager = system.spawn_actor(recording_manager!(config.clone())).await;
+
+        let result = manager
+            .call(RegisterEmitter::RecordingFailed(Emitter::new(failed)))
+            .await;
+        assert_matches!(result, Ok(_));
+
+        let result = manager
+            .call(StartRecording {
+                schedule: recording_schedule!(
+                    RecordingScheduleState::Scheduled,
+                    program!(program_id, now, "1h"),
+                    service!((0, 1), "sv", channel_gr!("ch", "unavailable-once")),
+                    recording_options!("1.m2ts", 0)
+                ),
+            })
+            .await;
+        assert_matches!(result, Ok(Ok(())));
+
+        let result = manager.call(QueryRecordingSchedule { program_id }).await;
+        assert_matches!(result, Ok(Ok(schedule)) => {
+            assert_matches!(schedule.state, RecordingScheduleState::Failed);
+        });
+    }
+    system.shutdown().await;
+}
+
+#[test(tokio::test)]
 async fn test_update_schedules_by_epg_services() {
     let now = Jst::now();
 

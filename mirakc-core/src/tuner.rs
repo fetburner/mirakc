@@ -1757,6 +1757,8 @@ pub(crate) mod stub {
     #[derive(Clone, Default)]
     pub(crate) struct TunerManagerStub {
         expected_priority: Option<TunerUserPriority>,
+        // Shared between clones so that "unavailable-once" fails only once.
+        unavailable_once: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl TunerManagerStub {
@@ -1765,6 +1767,7 @@ pub(crate) mod stub {
                 expected_priority: test_config
                     .get("tuner_user_priority")
                     .map(|json| serde_json::from_str(json).unwrap()),
+                ..Default::default()
             }
         }
     }
@@ -1806,6 +1809,11 @@ pub(crate) mod stub {
         ) -> actlet::Result<<StartStreaming as Message>::Reply> {
             if let Some(expected_priority) = self.expected_priority {
                 assert_eq!(msg.user.priority, expected_priority);
+            }
+            if msg.channel.channel == "unavailable-once"
+                && !self.unavailable_once.swap(true, Ordering::SeqCst)
+            {
+                return Ok(Err(Error::TunerUnavailable));
             }
             if msg.channel.channel == "ch" {
                 let (tx, stream) = BroadcasterStream::new_for_test();
